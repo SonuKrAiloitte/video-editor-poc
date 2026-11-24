@@ -1,0 +1,68 @@
+{
+  "aspect": "9:16",
+  "originalVolume": 1,
+  "clips": [
+    {
+      "id": "c1",
+      "name": "clipA_h264_16x9.mp4",
+      "src": "/media/clipA_h264_16x9.mp4",
+      "in": 1,
+      "out": 5,
+      "srcDuration": 8,
+      "muted": false,
+      "hasAudio": true,
+      "channels": 1
+    },
+    {
+      "id": "c2",
+      "name": "clipC_vp9.webm",
+      "src": "/media/clipC_vp9.webm",
+      "in": 0.5,
+      "out": 3.5,
+      "srcDuration": 5,
+      "muted": true,
+      "hasAudio": true,
+      "channels": 1
+    },
+    {
+      "id": "c3",
+      "name": "clipB_h264_9x16.mp4",
+      "src": "/media/clipB_h264_9x16.mp4",
+      "in": 0,
+      "out": 3,
+      "srcDuration": 6,
+      "muted": false,
+      "hasAudio": true,
+      "channels": 1
+    }
+  ],
+  "overlays": [
+    {
+      "id": "o1",
+      "kind": "text",
+      "text": "Diwali Sale: 40% off",
+      "fontSize": 44,
+      "color": "#FFFFFF",
+      "x": 0.5,
+      "y": 0.18,
+      "start": 0.5,
+      "end": 6
+    },
+    {
+      "id": "o2",
+      "kind": "image",
+      "src": "/media/logo.png",
+      "width": 0.28,
+      "x": 0.8,
+      "y": 0.92,
+      "start": 0,
+      "end": 10
+    }
+  ],
+  "music": {
+    "src": "/media/music.mp3",
+    "name": "music.mp3",
+    "volume": 0.35,
+    "channels": 1
+  }
+}
