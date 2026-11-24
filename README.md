@@ -40,6 +40,8 @@ npm run dev            # app on http://localhost:5180
 
 Open `http://localhost:5180/#own` for the own-core editor and `http://localhost:5180/#twick` for Twick.
 
+On Linux, the FFmpeg build that `ffmpeg-static` downloads has no `drawtext` filter, so the test clips and any export with text fail. Point the scripts and the render server at a system FFmpeg instead: `export FFMPEG_BIN=/usr/bin/ffmpeg` before `npm run media` and `npm run server`.
+
 To reproduce Twick's WebM failure: in Twick press **New Project**, add the WebM clip with **Add to timeline**, then **Export**.
 
 ## Checks without a browser
