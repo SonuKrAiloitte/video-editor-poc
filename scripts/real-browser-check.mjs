@@ -42,13 +42,27 @@ for (const file of paths) {
   const before = await state();
   const nErr = errors.length;
   await input.uploadFile(file);
-  let now = before, kind = null;
+  let now = before, kind = null, added = false;
+  const name = file.split(/[\\/]/).pop();
   for (let i = 0; i < 240 && !kind; i++) {
     await wait(250);
+    // an import lands in the Library; its "+" puts it on the timeline (playhead at the end, so it goes last)
+    if (!added) {
+      added = await page.evaluate((name) => {
+        // wait for this import to finish (a file with the same name may already be listed from an earlier run)
+        if (!(!!([...document.querySelectorAll(".lib.own")].find((x) => x.querySelector(".lib-name")?.textContent === name)) && !document.querySelector(".lib.pending"))) return false;
+        const item = [...document.querySelectorAll(".lib.own")].find((x) => x.querySelector(".lib-name")?.textContent === name);
+        if (!item) return false;
+        window.__poc.seek(1e9);
+        item.querySelector(".lib-add").click();
+        return true;
+      }, name);
+      if (added) await wait(400);
+    }
     now = await state();
     if (now.n > before.n) kind = "video";
     else if (now.nAudio > before.nAudio) kind = "audio";
-    else if (now.notice && now.notice !== before.notice && !/Converting it on the server/.test(now.notice)) kind = "notice"; // "Converting..." means: keep waiting
+    else if (now.notice && now.notice !== before.notice && !/is back in the Library/.test(now.notice)) kind = "notice"; // "Converting..." means: keep waiting
     else if (errors.length > nErr) kind = "error";
   }
   const tag = `${want.file.padEnd(34)} [${want.video ? `${want.video} ${want.size} ${want.fps}fps, ` : ""}${want.audio ?? "no audio"}, ${want.duration}s]`;

@@ -11,13 +11,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ALL_FORMATS, BlobSource, Input } from "mediabunny";
 import { DEFAULT_FONT, FONTS, fontFor } from "../../shared/fonts.js";
-import { RATIOS, audioLen, canPlace, normalizeProject, overlapsOnTrack, refuseReason, resolveAspect, type ItemKind } from "../../shared/model.js";
+import { RATIOS, applyTrackStates, audioLen, canPlace, layers, normalizeProject, overlapsOnTrack, refuseReason, resolveAspect, type ItemKind } from "../../shared/model.js";
 import sample from "../../shared/sample-project.json";
-import { drawMain, drawOverlays, getImage, loadImage, preloadOverlayAssets } from "./compose";
+import { drawMain, drawOverlays, getImage, loadImage, mainRect, measureTitle, preloadOverlayAssets } from "./compose";
 import { blobNames, exportFfmpegWasm, exportMediabunny, exportServer, type ExportResult } from "./exporters";
 import {
   clipAt, clipLen, clipStarts, frameSize, insertIndexAt, mainLength, moveClip, splitAt, totalDuration, uid,
-  type Aspect, type AudioItem, type Clip, type ImageOverlay, type Overlay, type Project, type TrackKind, type VideoOverlay,
+  type AudioItem, type Clip, type ImageOverlay, type Overlay, type Project, type TrackKind, type TrackState,
 } from "./project";
 
 const STORAGE_KEY = "poc-own-editor-draft-v1";
@@ -49,6 +49,37 @@ const BUILT_IN = [
   { name: "music.mp3", kind: "audio" },
   { name: "logo.png", kind: "image" },
 ] as const;
+
+const LIBRARY_KEY = "poc-own-library-v1";
+const loadLibrary = (): Media[] => {
+  try {
+    const raw = localStorage.getItem(LIBRARY_KEY);
+    // only entries stored on the server; a blob: link from an earlier page load no longer works
+    if (raw) return (JSON.parse(raw) as Media[]).filter((m) => !m.src.startsWith("blob:"));
+  } catch {
+    /* storage unavailable */
+  }
+  return [];
+};
+/**
+ * Is a file used on the timeline still available? Built-in test files always are. An imported file is, while it is
+ * in the Library. A blob: link (a file the browser holds for this page only) dies when the page reloads; blobNames
+ * lists the links made since this page loaded.
+ */
+const isMissing = (src: string, librarySrcs: Set<string>) =>
+  !src.startsWith("/media/") && (src.startsWith("blob:") ? !blobNames.has(src) : !librarySrcs.has(src));
+/** the file name an item came from (uploads are saved as "<time>_<name>") */
+const fileNameOf = (src: string) => decodeURIComponent(src.split("?")[0]!.split("/").pop() ?? "").replace(/^\d{10,}_/, "");
+/** names of the files in an edit that are missing */
+const missingFiles = (p: Project, librarySrcs: Set<string>) => [
+  ...new Set([
+    ...p.clips.filter((c) => isMissing(c.src, librarySrcs)).map((c) => c.name),
+    ...p.overlays.flatMap((o) => (o.kind !== "text" && isMissing(o.src, librarySrcs) ? [o.kind === "video" ? o.name : fileNameOf(o.src)] : [])),
+    ...p.audios.filter((a) => isMissing(a.src, librarySrcs)).map((a) => a.name),
+  ]),
+];
+const missingMessage = (names: string[]) =>
+  `${names.join(", ")} ${names.length > 1 ? "are" : "is"} not in the Library any more (removed, or imported before imported files were kept), so ${names.length > 1 ? "they are" : "it is"} marked red on the timeline. Import the file again to put it back, or delete the red clip${names.length > 1 ? "s" : ""}.`;
 
 const loadDraft = (): Project => {
   try {
@@ -133,11 +164,61 @@ const VIDEO_EXT = ["mp4", "mov", "webm", "avi", "mkv", "m4v", "3gp", "wmv", "flv
 const AUDIO_EXT = ["mp3", "wav", "ogg", "m4a", "aac", "flac", "opus"];
 
 /** HH:MM:SS:FF at 30 frames a second, as CapCut shows it */
+/** "mm:ss.s" for the captions list */
+const short = (t: number) => `${Math.floor(t / 60)}:${(t % 60).toFixed(1).padStart(4, "0")}`;
+/** Read an .srt or .vtt file into caption lines. Line breaks inside a caption become spaces (captions are one line). */
+function parseSubtitles(text: string): { start: number; end: number; text: string }[] {
+  const sec = (s: string) => {
+    const parts = s.trim().replace(",", ".").split(":").map(Number);
+    return parts.reduce((acc, p) => acc * 60 + p, 0);
+  };
+  return text.replace(/\r/g, "").split(/\n\s*\n/).flatMap((block) => {
+    const lines = block.trim().split("\n");
+    const at = lines.findIndex((l) => l.includes("-->"));
+    if (at < 0) return [];
+    const [a, b] = lines[at]!.split("-->");
+    const words = lines.slice(at + 1).join(" ").replace(/<[^>]+>/g, "").trim();
+    const start = sec(a ?? ""), end = sec((b ?? "").trim().split(" ")[0] ?? "");
+    return words && end > start ? [{ start, end, text: words }] : [];
+  });
+}
+const CAPTION_STYLE = { font: "jakarta", fontSize: 34, color: "#FFFFFF", bg: "#000000", bgOpacity: 0.6, x: 0.5, y: 0.86 };
+
 const fmt = (t: number) => {
   const f = Math.round(t * 30);
   const two = (n: number) => String(n).padStart(2, "0");
   return `${two(Math.floor(f / 108000))}:${two(Math.floor(f / 1800) % 60)}:${two(Math.floor(f / 30) % 60)}:${two(f % 30)}`;
 };
+/** track header icons (lock, eye, speaker), drawn inline so they follow the text colour */
+const Icon = ({ name }: { name: "lock" | "unlock" | "eye" | "eye-off" | "sound" | "mute" }) => {
+  const paths: Record<string, string> = {
+    lock: "M7 11V8a5 5 0 0 1 10 0v3M5 11h14v10H5z",
+    unlock: "M7 11V8a5 5 0 0 1 9.6-2M5 11h14v10H5z",
+    eye: "M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12zm10-3a3 3 0 1 0 0 6 3 3 0 0 0 0-6z",
+    "eye-off": "M3 3l18 18M10.6 5.1A10 10 0 0 1 12 5c6.4 0 10 7 10 7a17 17 0 0 1-3.2 4.1M6.7 6.7C3.8 8.6 2 12 2 12s3.6 7 10 7a9.7 9.7 0 0 0 5.3-1.6",
+    sound: "M4 9v6h4l5 4V5L8 9zM16.5 8.5a5 5 0 0 1 0 7M19 6a8.5 8.5 0 0 1 0 12",
+    mute: "M4 9v6h4l5 4V5L8 9zM17 9l5 6M22 9l-5 6",
+  };
+  return <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d={paths[name]} /></svg>;
+};
+
+/** The left-hand header of a track: its name and the lock / hide / mute buttons (audio tracks have no hide). */
+function TrackHead({ name, kind, state, onToggle }: { name: string; kind: "visual" | "main" | "audio"; state: TrackState; onToggle: (key: keyof TrackState) => void }) {
+  const btn = (key: keyof TrackState, on: boolean, icons: [Parameters<typeof Icon>[0]["name"], Parameters<typeof Icon>[0]["name"]], label: [string, string]) => (
+    <button className={`tbtn ${on ? "on" : ""}`} aria-pressed={on} aria-label={`${on ? label[1] : label[0]} ${name}`} title={on ? label[1] : label[0]} onClick={() => onToggle(key)}>
+      <Icon name={on ? icons[1] : icons[0]} />
+    </button>
+  );
+  return (
+    <div className={`track ${kind} head ${state.locked ? "is-locked" : ""}`}>
+      <span className="tname">{name}</span>
+      {btn("locked", !!state.locked, ["unlock", "lock"], ["Lock", "Unlock"])}
+      {kind !== "audio" ? btn("hidden", !!state.hidden, ["eye", "eye-off"], ["Hide", "Show"]) : <span className="tbtn-space" />}
+      {btn("muted", !!state.muted, ["sound", "mute"], ["Mute", "Unmute"])}
+    </div>
+  );
+}
+
 /** a small box drawn in the shape of a ratio, for the ratio menu */
 const RatioIcon = ({ aspect }: { aspect: string }) => {
   const [w, h] = aspect.split(":").map(Number);
@@ -158,12 +239,40 @@ export function OwnEditor() {
 
   const [t, setT] = useState(0);
   const [playing, setPlaying] = useState(false);
-  const [sel, setSel] = useState<Ref | null>(null);
+  /** everything selected on the timeline; the last one picked is the one the Inspector shows */
+  const [selected, setSelected] = useState<Ref[]>([]);
+  const sel = selected[selected.length - 1] ?? null;
+  const setSel = useCallback((r: Ref | null) => setSelected(r ? [r] : []), []);
+  const isSel = (id: string) => selected.some((x) => x.id === id);
+  /** box selection: a rectangle dragged over empty timeline */
+  const [box, setBox] = useState<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
+  /** a Library file playing in the player, before it is put on the timeline */
+  const [libPreview, setLibPreview] = useState<Media | null>(null);
   const [zoom, setZoom] = useState(60); // px per second
   const [notice, setNotice] = useState<string | null>(null);
   /** row the pointer is over during a drag, and whether the dragged thing may go there */
   const [hover, setHover] = useState<{ row: RowId; ok: boolean } | null>(null);
-  const [library, setLibrary] = useState<Media[]>([]);
+  const [library, setLibrary] = useState<Media[]>(loadLibrary);
+  /** files being imported, by name, with what is happening to them; shown as rows in the Library */
+  const [pending, setPending] = useState<Record<string, { kind: Media["kind"]; step: string }>>({});
+  const stepOf = (name: string, kind: Media["kind"], step: string | null) =>
+    setPending((cur) => {
+      const next = { ...cur };
+      if (step) next[name] = { kind, step };
+      else delete next[name];
+      return next;
+    });
+  const librarySrcs = new Set(library.map((m) => m.src));
+  const libRef = useRef(library);
+  libRef.current = library;
+  const missing = (src: string) => isMissing(src, librarySrcs);
+  useEffect(() => {
+    try {
+      localStorage.setItem(LIBRARY_KEY, JSON.stringify(library));
+    } catch {
+      /* ignore */
+    }
+  }, [library]);
   const [libTab, setLibTab] = useState<"media" | "audio">("media");
   /** the Library item being dragged, drawn next to the pointer */
   const [ghost, setGhost] = useState<{ name: string; kind: Media["kind"]; x: number; y: number } | null>(null);
@@ -201,6 +310,10 @@ export function OwnEditor() {
   }, [ratioOpen]);
 
   useEffect(() => void preloadOverlayAssets(p), [p]);
+  useEffect(() => {
+    const lost = missingFiles(pRef.current, new Set(libRef.current.map((m) => m.src)));
+    if (lost.length) setNotice(missingMessage(lost));
+  }, []);
 
   useEffect(() => {
     let raf = 0;
@@ -233,7 +346,7 @@ export function OwnEditor() {
       // cap the step: if the browser stalls frames (background tab), playback waits instead of jumping ahead
       const dt = Math.min(0.1, (now - last) / 1000);
       last = now;
-      const proj = pRef.current;
+      const proj = applyTrackStates(pRef.current); // hidden and muted tracks
       const dur = totalDuration(proj);
       if (playRef.current) {
         tRef.current = Math.min(dur, tRef.current + dt);
@@ -292,15 +405,16 @@ export function OwnEditor() {
       if (cv && ctx) {
         const keep = (lastFrame.current ??= document.createElement("canvas"));
         const sameSize = keep.width === cv.width && keep.height === cv.height;
-        const still = hit?.clip.kind === "image" ? getImage(hit.clip.src) : undefined;
-        if (still || (active && active.readyState >= 2)) {
+        const showMain = !!hit && !hit.clip.hidden;
+        const still = showMain && hit?.clip.kind === "image" ? getImage(hit.clip.src) : undefined;
+        if (still || (showMain && active && active.readyState >= 2)) {
           ctx.fillStyle = "#000";
           ctx.fillRect(0, 0, cv.width, cv.height);
-          if (still) drawMain(ctx, hit?.clip.fit, still, still.naturalWidth, still.naturalHeight, cv.width, cv.height);
-          else if (active) drawMain(ctx, hit?.clip.fit, active, active.videoWidth, active.videoHeight, cv.width, cv.height);
+          if (still) drawMain(ctx, hit!.clip, still, still.naturalWidth, still.naturalHeight, cv.width, cv.height);
+          else if (active) drawMain(ctx, hit!.clip, active, active.videoWidth, active.videoHeight, cv.width, cv.height);
           if (!sameSize) (keep.width = cv.width), (keep.height = cv.height);
           keep.getContext("2d")?.drawImage(cv, 0, 0);
-        } else if (hit && sameSize) {
+        } else if (showMain && sameSize) {
           // mid-seek: hold the previous frame instead of flashing black
           ctx.drawImage(keep, 0, 0);
         } else {
@@ -322,22 +436,127 @@ export function OwnEditor() {
     };
   }, []);
 
-  // drag the selected item around the preview
-  const dragOnPreview = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (sel?.type !== "overlay") return;
-    const rect = e.currentTarget.getBoundingClientRect();
-    const id = sel.id;
+  // ------------------------------------------------------------------ select, move, resize and turn on the preview
+  type Box = { cx: number; cy: number; w: number; h: number; rot: number }; // in preview canvas pixels
+  /** where an item is drawn on the preview at `time`, or null when it is not on screen then */
+  const boxOf = (ref: Ref, proj: Project, time: number): Box | null => {
+    const [fw, fh] = frameSize(proj, 720);
+    if (ref.type === "clip") {
+      const hit = clipAt(proj, time);
+      if (!hit || hit.clip.id !== ref.id) return null;
+      const c = hit.clip;
+      const img = c.kind === "image" ? getImage(c.src) : undefined;
+      const v = videos.current.get(c.id);
+      const sw = img?.naturalWidth || v?.videoWidth || Math.round((c.ratio ?? 16 / 9) * 1000);
+      const sh = img?.naturalHeight || v?.videoHeight || 1000;
+      return { ...mainRect(c, sw, sh, fw, fh), rot: c.rotation ?? 0 };
+    }
+    if (ref.type !== "overlay") return null;
+    const o = proj.overlays.find((x) => x.id === ref.id);
+    if (!o || time < o.start || time > o.end) return null;
+    if (o.kind === "text") return { cx: o.x * fw, cy: o.y * fh, ...measureTitle(o, fw, fh), rot: o.rotation ?? 0 };
+    let ratio = 16 / 9;
+    const img = o.kind === "image" ? getImage(o.src) : undefined;
+    const v = o.kind === "video" ? videos.current.get(o.id) : undefined;
+    if (img?.naturalWidth) ratio = img.naturalWidth / img.naturalHeight;
+    else if (v?.videoWidth) ratio = v.videoWidth / v.videoHeight;
+    const w = o.width * fw;
+    return { cx: o.x * fw, cy: o.y * fh, w, h: w / ratio, rot: o.rotation ?? 0 };
+  };
+  const inside = (b: Box, x: number, y: number) => {
+    const a = (-b.rot * Math.PI) / 180;
+    const dx = x - b.cx, dy = y - b.cy;
+    return Math.abs(dx * Math.cos(a) - dy * Math.sin(a)) <= b.w / 2 && Math.abs(dx * Math.sin(a) + dy * Math.cos(a)) <= b.h / 2;
+  };
+  /** what is under a point of the preview now: the top visible item first, then the main-track clip */
+  const itemAt = (x: number, y: number): Ref | null => {
+    const proj = applyTrackStates(pRef.current);
+    const time = tRef.current;
+    for (const o of [...layers(proj)].reverse()) {
+      const b = boxOf({ type: "overlay", id: o.id }, proj, time);
+      if (b && inside(b, x, y)) return { type: "overlay", id: o.id };
+    }
+    const hit = clipAt(proj, time);
+    if (hit && !hit.clip.hidden) {
+      const b = boxOf({ type: "clip", id: hit.clip.id }, proj, time);
+      if (b && inside(b, x, y)) return { type: "clip", id: hit.clip.id };
+    }
+    return null;
+  };
+  const toCanvas = (ev: { clientX: number; clientY: number }) => {
+    const cv = canvasRef.current!;
+    const r = cv.getBoundingClientRect();
+    return { x: ((ev.clientX - r.left) * cv.width) / r.width, y: ((ev.clientY - r.top) * cv.height) / r.height };
+  };
+  const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
+  /**
+   * Move (drag inside the box), resize (drag a corner; keeps the shape) or turn (drag the round handle) an item.
+   * Moving snaps to the centre lines; turning snaps to 0 and 90 degrees, and to 15-degree steps with Shift held.
+   */
+  const transformItem = (e: React.PointerEvent, ref: Ref, mode: "move" | "scale" | "turn") => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (locked(rowOf(ref))) return void setNotice(LOCKED);
+    const start = pRef.current;
+    const box = boxOf(ref, start, tRef.current);
+    if (!box) return;
+    const [fw, fh] = frameSize(start, 720);
+    const p0 = toCanvas(e);
+    const clip0 = ref.type === "clip" ? start.clips.find((c) => c.id === ref.id) : undefined;
+    const ov0 = ref.type === "overlay" ? start.overlays.find((o) => o.id === ref.id) : undefined;
+    const x0 = clip0 ? clip0.x ?? 0.5 : ov0!.x;
+    const y0 = clip0 ? clip0.y ?? 0.5 : ov0!.y;
+    const angle = (p: { x: number; y: number }) => (Math.atan2(p.y - box.cy, p.x - box.cx) * 180) / Math.PI;
     h.checkpoint();
     const move = (ev: PointerEvent) => {
-      const x = Math.min(1, Math.max(0, (ev.clientX - rect.left) / rect.width));
-      const y = Math.min(1, Math.max(0, (ev.clientY - rect.top) / rect.height));
-      h.apply({ ...pRef.current, overlays: pRef.current.overlays.map((o) => (o.id === id ? { ...o, x, y } : o)) });
+      const p1 = toCanvas(ev);
+      let patch: Partial<Clip> & Record<string, number> = {};
+      if (mode === "move") {
+        let x = clamp(x0 + (p1.x - p0.x) / fw, -0.5, 1.5);
+        let y = clamp(y0 + (p1.y - p0.y) / fh, -0.5, 1.5);
+        if (Math.abs(x - 0.5) < 0.012) x = 0.5;
+        if (Math.abs(y - 0.5) < 0.012) y = 0.5;
+        patch = { x, y };
+      } else if (mode === "scale") {
+        const f = Math.hypot(p1.x - box.cx, p1.y - box.cy) / Math.max(1, Math.hypot(p0.x - box.cx, p0.y - box.cy));
+        if (clip0) patch = { scale: clamp((clip0.scale ?? 1) * f, 0.1, 5) };
+        else if (ov0!.kind === "text") patch = { fontSize: clamp(Math.round(ov0!.fontSize * f), 8, 400) };
+        else patch = { width: clamp((ov0 as { width: number }).width * f, 0.02, 3) };
+      } else {
+        let deg = box.rot + angle(p1) - angle(p0);
+        deg = ((((deg + 180) % 360) + 360) % 360) - 180;
+        if (ev.shiftKey) deg = Math.round(deg / 15) * 15;
+        else for (const snapTo of [0, 90, -90, 180, -180]) if (Math.abs(deg - snapTo) < 4) deg = snapTo;
+        patch = { rotation: Math.round(deg * 10) / 10 };
+      }
+      const cur = pRef.current;
+      h.apply(clip0
+        ? { ...cur, clips: cur.clips.map((c) => (c.id === ref.id ? { ...c, ...patch } : c)) }
+        : { ...cur, overlays: cur.overlays.map((o) => (o.id === ref.id ? ({ ...o, ...patch } as Overlay) : o)) });
     };
-    move(e.nativeEvent);
     const up = () => (window.removeEventListener("pointermove", move), window.removeEventListener("pointerup", up));
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", up);
   };
+  /** a press on the preview selects what is under it (and starts moving it); on empty frame it clears the selection */
+  const pressPreview = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    const { x, y } = toCanvas(e);
+    const ref = itemAt(x, y);
+    if (!ref) return setSelected([]);
+    setSel(ref);
+    transformItem(e, ref, "move");
+  };
+  /** the selection box drawn over the preview, in CSS pixels inside .preview */
+  const selBox = (() => {
+    const cv = canvasRef.current;
+    if (!sel || !cv || libPreview) return null;
+    const b = boxOf(sel, applyTrackStates(p), t);
+    if (!b) return null;
+    const a = cv.getBoundingClientRect();
+    const host = cv.parentElement!.getBoundingClientRect();
+    const k = a.width / cv.width;
+    return { left: a.left - host.left + (b.cx - b.w / 2) * k, top: a.top - host.top + (b.cy - b.h / 2) * k, width: b.w * k, height: b.h * k, rot: b.rot };
+  })();
 
   // ------------------------------------------------------------------ edit helpers
   const patchClip = (id: string, patch: Partial<Clip>, live = false) => {
@@ -352,13 +571,30 @@ export function OwnEditor() {
     const next = { ...pRef.current, audios: pRef.current.audios.map((a) => (a.id === id ? { ...a, ...patch } : a)) };
     live ? h.apply(next) : h.commit(next);
   };
-  const removeSelected = () => {
-    if (!sel) return;
+  /** the row an item sits on */
+  const rowOf = (r: Ref): RowId => {
     const cur = pRef.current;
-    if (sel.type === "clip") h.commit({ ...cur, clips: cur.clips.filter((c) => c.id !== sel.id) });
-    if (sel.type === "overlay") h.commit({ ...cur, overlays: cur.overlays.filter((o) => o.id !== sel.id) });
-    if (sel.type === "audio") h.commit({ ...cur, audios: cur.audios.filter((a) => a.id !== sel.id) });
-    setSel(null);
+    if (r.type === "clip") return "main";
+    if (r.type === "overlay") return cur.overlays.find((o) => o.id === r.id)?.track ?? "main";
+    return cur.audios.find((a) => a.id === r.id)?.track ?? "main";
+  };
+  const locked = (row: RowId) => (row === "main" ? !!pRef.current.main?.locked : !!pRef.current.tracks.find((x) => x.id === row)?.locked);
+  const LOCKED = "This track is locked. Unlock it with the lock button on its left to change what is on it.";
+  /** Delete everything selected, except what sits on a locked track. */
+  const removeSelected = () => {
+    if (!selected.length) return;
+    const cur = pRef.current;
+    const gone = new Set(selected.filter((r) => !locked(rowOf(r))).map((r) => r.id));
+    const kept = selected.length - gone.size;
+    if (gone.size) h.commit({ ...cur, clips: cur.clips.filter((c) => !gone.has(c.id)), overlays: cur.overlays.filter((o) => !gone.has(o.id)), audios: cur.audios.filter((a) => !gone.has(a.id)) });
+    setNotice(kept ? `${kept} item${kept > 1 ? "s" : ""} on a locked track ${kept > 1 ? "were" : "was"} kept.` : null);
+    setSelected([]);
+  };
+  const toggleTrack = (row: RowId, key: keyof TrackState) => {
+    const cur = pRef.current;
+    if (key === "locked") setSelected((list) => list.filter((r) => rowOf(r) !== row));
+    if (row === "main") h.commit({ ...cur, main: { ...cur.main, [key]: !cur.main?.[key] } });
+    else h.commit({ ...cur, tracks: cur.tracks.map((x) => (x.id === row ? { ...x, [key]: !x[key] } : x)) });
   };
   /** width that fits a picture of this shape inside the frame */
   const fitWidth = (ratio: number | undefined, proj: Project) => {
@@ -396,8 +632,8 @@ export function OwnEditor() {
    * A file the browser cannot work with (AVI, an unsupported codec, HDR phone footage) is sent to the server,
    * which returns a plain H.264 MP4. The editor then uses that copy like any other clip.
    */
-  const convertOnServer = async (src: string, name: string, why: string) => {
-    setNotice(`${name}: ${why}. Converting it on the server...`);
+  const convertOnServer = async (src: string, name: string, _why: string) => {
+    if (pending[name] || src.startsWith("blob:")) stepOf(name, "video", "Converting…");
     let remote = src;
     if (src.startsWith("blob:")) {
       const up = await fetch(`/api/upload/${encodeURIComponent(name)}`, { method: "PUT", body: await (await fetch(src)).blob() });
@@ -425,7 +661,6 @@ export function OwnEditor() {
       if (converted) throw new Error("the converted copy could not be opened either");
       const done = await convertOnServer(src, name, why);
       const media = await prepare(done.src, name, "video", "x");
-      setNotice(`${name}: ${why}, so the server converted it to MP4 in ${(done.ms / 1000).toFixed(1)} s.`);
       return media;
     }
     return { name, src, kind, duration: info!.duration, hasAudio: info!.hasAudio, channels: info!.channels, ratio: info!.ratio };
@@ -435,7 +670,7 @@ export function OwnEditor() {
   const place = (m: Media, row: RowId, time: number): boolean => {
     let proj = pRef.current;
     const rowKind = kindOfRow(proj, row);
-    const reason = rowKind === "new" ? null : refuseReason(m.kind, rowKind);
+    const reason = rowKind === "new" ? null : locked(row) ? LOCKED : refuseReason(m.kind, rowKind);
     if (reason) {
       setNotice(`${m.name}: ${reason}`);
       return false;
@@ -466,63 +701,189 @@ export function OwnEditor() {
     return true;
   };
 
-  /** Clicking a Library item (or importing a file) adds it where it usually goes. */
-  const addDefault = (m: Media) => {
+  /**
+   * "+" on a Library item: put it at the playhead. Video and images go into the main track at that exact time
+   * (the clip under the playhead is split there, as CapCut does); audio goes on a free audio track or a new one.
+   */
+  const addAtPlayhead = (m: Media) => {
+    setLibPreview(null);
     const proj = pRef.current;
-    if (m.kind === "video") return place(m, "main", mainLength(proj));
+    const at = Math.round(tRef.current * 10) / 10;
     if (m.kind === "audio") {
-      const track = proj.tracks.find((x) => x.kind === "audio" && !overlapsOnTrack(itemsOn(proj), x.id, 0, m.duration));
-      return place(m, track?.id ?? "new", 0);
+      const free = proj.tracks.find((x) => x.kind === "audio" && !x.locked && !overlapsOnTrack(itemsOn(proj), x.id, at, at + m.duration));
+      place(m, free?.id ?? "new", at);
+      return;
     }
-    // an image: as a logo over the whole edit, on a new top track
-    const end = Math.max(IMAGE_SECONDS, totalDuration(proj));
-    const ok = place({ ...m, duration: end }, "new", 0);
-    if (ok) h.apply({ ...pRef.current, overlays: pRef.current.overlays.map((o) => (o.kind === "image" && o.src === m.src && o.start === 0 ? { ...o, width: 0.25 } : o)) });
-    return ok;
+    if (proj.main?.locked) return void setNotice(LOCKED);
+    const split = splitAt(proj, at);
+    const st = clipStarts(split);
+    let idx = st.findIndex((x) => x >= at - 0.05);
+    if (idx === -1) idx = split.clips.length;
+    const clip: Clip = { id: uid(), kind: m.kind === "image" ? "image" : "video", name: m.name, src: m.src, in: 0, out: m.duration, srcDuration: m.kind === "image" ? 3600 : m.duration, muted: false, hasAudio: m.hasAudio, channels: m.channels, ratio: m.ratio };
+    const clips = [...split.clips];
+    clips.splice(idx, 0, clip);
+    h.commit({ ...split, clips });
+    setSel({ type: "clip", id: clip.id });
+    setNotice(idx === split.clips.length && at > mainLength(proj) + 0.05 ? `${m.name} was added at the end of the main track, which has no gaps.` : null);
+  };
+  /** Clicking a Library item plays it in the player; it goes on the timeline only by dragging it there or with "+". */
+  const previewLibrary = (m: Media) => {
+    setPlaying(false);
+    setLibPreview(m);
   };
 
   const builtIn = useRef(new Map<string, Promise<Media>>());
-  const mediaFor = (name: string, kind: Media["kind"]) => {
-    const own = library.find((m) => m.name === name);
-    if (own) return Promise.resolve(own);
+  /** `own`: an imported file; otherwise one of the built-in test files (they may share a name) */
+  const mediaFor = (name: string, kind: Media["kind"], own = false) => {
+    const mine = own ? library.find((m) => m.name === name) : undefined;
+    if (mine) return Promise.resolve(mine);
     if (!builtIn.current.has(name)) builtIn.current.set(name, prepare(`/media/${name}`, name, kind));
     return builtIn.current.get(name)!;
   };
 
-  const onFiles = async (files: FileList | null) => {
-    for (const f of Array.from(files ?? [])) {
+  /** files picked in a file input (the input is cleared first, so picking the same file again still imports it) */
+  const onFiles = async (files: File[]) => {
+    for (const f of files) {
       const url = URL.createObjectURL(f);
       blobNames.set(url, f.name);
       const ext = f.name.split(".").pop()?.toLowerCase() ?? "";
       const kind = f.type.startsWith("video") || VIDEO_EXT.includes(ext) ? "video" : f.type.startsWith("audio") || AUDIO_EXT.includes(ext) ? "audio" : "image";
+      stepOf(f.name, kind, "Checking…");
       try {
-        const m = await prepare(url, f.name, kind);
+        const prepared = await prepare(url, f.name, kind);
+        // keep the file: a blob: link dies when the page reloads, so store it on the server
+        // (production: the browser uploads straight to S3 and the edit keeps the S3 key)
+        let src = prepared.src;
+        if (src.startsWith("blob:")) {
+          stepOf(f.name, kind, "Saving…");
+          const up = await fetch(`/api/upload/${encodeURIComponent(f.name)}`, { method: "PUT", body: f });
+          if (!up.ok) throw new Error(`the server did not save it (${up.status})`);
+          src = ((await up.json()) as { src: string }).src;
+        }
+        const m = { ...prepared, src };
         setLibrary((lib) => [...lib.filter((x) => x.name !== m.name), m]);
+        // clips on the timeline that lost this file (same name) point at the new copy again
+        const before = new Set(libRef.current.map((x) => x.src));
+        const gone = (src: string) => isMissing(src, before);
+        const cur = pRef.current;
+        let relinked = 0;
+        const fix = <T extends { src: string }>(x: T, name: string): T => (name === m.name && gone(x.src) ? (relinked++, { ...x, src: m.src }) : x);
+        const next = {
+          ...cur,
+          clips: cur.clips.map((c) => fix(c, c.name)),
+          overlays: cur.overlays.map((o) => (o.kind === "text" ? o : fix(o, o.kind === "video" ? o.name : fileNameOf(o.src)))),
+          audios: cur.audios.map((a) => fix(a, a.name)),
+        };
+        if (relinked) h.commit(next);
         setLibTab(m.kind === "audio" ? "audio" : "media"); // show the tab the new file is in
-        addDefault(m);
+        // no message for a plain import (the file appears in the Library); only when red clips came back
+        if (relinked) setNotice(`${m.name} is back in the Library; ${relinked} red clip${relinked > 1 ? "s use" : " uses"} it again.`);
       } catch (e) {
         const reason = e instanceof Error ? e.message.trim().split(/\r?\n/).pop() : "unknown error";
         setNotice(`${f.name}: could not be imported (${reason}).`);
+      } finally {
+        stepOf(f.name, kind, null);
       }
     }
+  };
+  /** how many places on the timeline use this file */
+  const usesOf = (src: string, proj = pRef.current) =>
+    proj.clips.filter((c) => c.src === src).length + proj.overlays.filter((o) => o.kind !== "text" && o.src === src).length + proj.audios.filter((a) => a.src === src).length;
+  /** Take an imported file out of the Library. Clips that use it stay on the timeline, marked red. */
+  const removeFromLibrary = (m: Media) => {
+    const n = usesOf(m.src);
+    if (n && !window.confirm(`${m.name} is used ${n} time${n > 1 ? "s" : ""} on the timeline. Remove it from the Library? Those clips will be marked red and the edit cannot be exported until you import the file again or delete them.`)) return;
+    setLibrary((lib) => lib.filter((x) => x.src !== m.src));
+    if (libPreview?.src === m.src) setLibPreview(null);
+    setNotice(n ? `${m.name} was removed from the Library; ${n} clip${n > 1 ? "s are" : " is"} now red.` : `${m.name} was removed from the Library.`);
   };
   const addText = () => {
     const proj = pRef.current;
     const start = Math.round(t * 10) / 10;
-    const top = proj.tracks.find((x) => x.kind === "visual");
+    const top = proj.tracks.find((x) => x.kind === "visual" && x.role !== "captions");
     const [next, track] = landing(proj, top?.id ?? "new", "visual", start, start + 3);
     const o: Overlay = { id: uid(), track, kind: "text", text: "New title", fontSize: 40, color: "#FFFFFF", x: 0.5, y: 0.5, start, end: start + 3 };
     h.commit({ ...next, overlays: [...next.overlays, o] });
     setSel({ type: "overlay", id: o.id });
   };
 
+  // ------------------------------------------------------------------ captions
+  const captionTrack = (proj: Project) => proj.tracks.find((x) => x.role === "captions");
+  const captionsOf = (proj: Project) => {
+    const tr = captionTrack(proj);
+    return tr ? proj.overlays.filter((o): o is Extract<Overlay, { kind: "text" }> => o.track === tr.id && o.kind === "text").sort((a, b) => a.start - b.start) : [];
+  };
+  /** the Captions track, made (at the top, drawn over everything) if there is none yet */
+  const withCaptionTrack = (proj: Project): [Project, string] => {
+    const tr = captionTrack(proj);
+    if (tr) return [proj, tr.id];
+    const id = uid();
+    return [{ ...proj, tracks: [{ id, kind: "visual", role: "captions" }, ...proj.tracks] }, id];
+  };
+  /** the style new captions get: the last caption's, or the default (white on a dark box, near the bottom) */
+  const captionStyle = (proj: Project) => {
+    const last = captionsOf(proj).at(-1);
+    return last ? { font: last.font, fontSize: last.fontSize, color: last.color, bg: last.bg, bgOpacity: last.bgOpacity, x: last.x, y: last.y } : CAPTION_STYLE;
+  };
+  /** "+ Caption": a line at the playhead, after any caption already showing there, until the next one */
+  const addCaption = () => {
+    let [proj, track] = withCaptionTrack(pRef.current);
+    const lines = captionsOf(proj);
+    let start = Math.round(tRef.current * 10) / 10;
+    const covering = lines.find((c) => start >= c.start && start < c.end);
+    if (covering) start = covering.end;
+    const next = lines.find((c) => c.start >= start);
+    const end = Math.min(start + 2.5, next ? next.start : Infinity, Math.max(totalDuration(proj), start + 2.5));
+    if (end - start < 0.3) return void setNotice("There is no room for a caption here. Move the playhead to a gap between captions.");
+    if (proj.tracks.find((x) => x.id === track)?.locked) return void setNotice(LOCKED);
+    const o: Overlay = { id: uid(), track, kind: "text", text: "Caption", ...captionStyle(proj), start, end };
+    proj = { ...proj, overlays: [...proj.overlays, o] };
+    h.commit(proj);
+    setSel({ type: "overlay", id: o.id });
+    seek(start);
+  };
+  /** captions from an .srt or .vtt file; they replace the captions already there (after asking) */
+  const importSubtitles = async (file: File | undefined) => {
+    if (!file) return;
+    const lines = parseSubtitles(await file.text());
+    if (!lines.length) return void setNotice(`${file.name}: no caption lines found. Use an .srt or .vtt file.`);
+    let [proj, track] = withCaptionTrack(pRef.current);
+    const old = captionsOf(proj);
+    if (old.length && !window.confirm(`Replace the ${old.length} caption${old.length > 1 ? "s" : ""} on the timeline with the ${lines.length} from ${file.name}?`)) return;
+    const style = captionStyle(proj);
+    const gone = new Set(old.map((c) => c.id));
+    const added: Overlay[] = lines.map((l) => ({ id: uid(), track, kind: "text", text: l.text, ...style, start: l.start, end: l.end }));
+    proj = { ...proj, overlays: [...proj.overlays.filter((o) => !gone.has(o.id)), ...added] };
+    h.commit(proj);
+    setSelected([]);
+    const past = lines.filter((l) => l.end > totalDuration({ ...proj, overlays: proj.overlays.filter((o) => !added.includes(o)) })).length;
+    if (past) setNotice(`${past} caption${past > 1 ? "s run" : " runs"} past the end of the video; the edit is longer now. Trim them or add video.`);
+  };
+  /** "Apply this style to all captions": font, size, colour, box and position */
+  const applyStyleToCaptions = (src: Extract<Overlay, { kind: "text" }>) => {
+    const cur = pRef.current;
+    const ids = new Set(captionsOf(cur).map((c) => c.id));
+    const style = { font: src.font, fontSize: src.fontSize, color: src.color, bg: src.bg, bgOpacity: src.bgOpacity, x: src.x, y: src.y };
+    h.commit({ ...cur, overlays: cur.overlays.map((o) => (ids.has(o.id) && o.kind === "text" ? { ...o, ...style } : o)) });
+  };
+
   // keyboard: space, S, Delete, Ctrl+Z / Ctrl+Shift+Z
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if ((e.target as HTMLElement).tagName === "INPUT") return;
+      if (["INPUT", "TEXTAREA", "SELECT"].includes((e.target as HTMLElement).tagName)) return;
       if (e.code === "Space") (e.preventDefault(), setPlaying((v) => !v));
       else if (e.key.toLowerCase() === "s") h.commit(splitAt(pRef.current, tRef.current));
       else if (e.key === "Delete" || e.key === "Backspace") removeSelected();
+      else if (e.key.toLowerCase() === "a" && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        const cur = pRef.current;
+        const all: Ref[] = [
+          ...cur.clips.map((c) => ({ type: "clip" as const, id: c.id })),
+          ...cur.overlays.map((o) => ({ type: "overlay" as const, id: o.id })),
+          ...cur.audios.map((a) => ({ type: "audio" as const, id: a.id })),
+        ];
+        setSelected(all.filter((r) => !locked(rowOf(r))));
+      }
       else if (e.key.toLowerCase() === "z" && (e.ctrlKey || e.metaKey)) (e.preventDefault(), e.shiftKey ? h.redo() : h.undo());
     };
     window.addEventListener("keydown", onKey);
@@ -556,7 +917,69 @@ export function OwnEditor() {
   };
   const allowed = (kind: ItemKind | null, proj: Project, row: RowId) => {
     const rk = kindOfRow(proj, row);
-    return !!kind && (rk === "new" || canPlace(kind, rk));
+    return !!kind && (rk === "new" || (canPlace(kind, rk) && !locked(row)));
+  };
+
+  /**
+   * Ctrl, Shift or Cmd + click adds an item to the selection or takes it out. Items on a locked track can be
+   * selected but not moved. Returns true when the press should not start a drag.
+   */
+  const pick = (e: React.PointerEvent, ref: Ref): boolean => {
+    e.stopPropagation();
+    if (e.shiftKey || e.ctrlKey || e.metaKey) {
+      setSelected((cur) => (cur.some((x) => x.id === ref.id) ? cur.filter((x) => x.id !== ref.id) : [...cur, ref]));
+      return true;
+    }
+    if (locked(rowOf(ref))) {
+      setSel(ref);
+      setNotice(LOCKED);
+      return true;
+    }
+    return false;
+  };
+  const lockedEdge = (e: React.PointerEvent, row: RowId) => {
+    if (!locked(row)) return false;
+    e.stopPropagation();
+    setNotice(LOCKED);
+    return true;
+  };
+
+  /** Drag on empty timeline to draw a box; everything it touches is selected (Ctrl/Shift adds to the selection). */
+  const startBox = (e: React.PointerEvent) => {
+    const el = e.target as HTMLElement;
+    if (el !== e.currentTarget && !el.classList.contains("empty")) return;
+    const add = e.shiftKey || e.ctrlKey || e.metaKey;
+    const base = add ? selected : [];
+    const x0 = e.clientX;
+    const y0 = e.clientY;
+    let moved = false;
+    const within = (b: { x0: number; y0: number; x1: number; y1: number }) =>
+      [...document.querySelectorAll<HTMLElement>(".tl .clip[data-ref]")]
+        .filter((c) => {
+          const r = c.getBoundingClientRect();
+          return r.right > Math.min(b.x0, b.x1) && r.left < Math.max(b.x0, b.x1) && r.bottom > Math.min(b.y0, b.y1) && r.top < Math.max(b.y0, b.y1);
+        })
+        .map((c) => {
+          const [type, id] = c.dataset.ref!.split(":") as [Ref["type"], string];
+          return { type, id };
+        })
+        .filter((r) => !locked(rowOf(r)));
+    const move = (ev: PointerEvent) => {
+      if (!moved && Math.hypot(ev.clientX - x0, ev.clientY - y0) < 4) return;
+      moved = true;
+      const b = { x0, y0, x1: ev.clientX, y1: ev.clientY };
+      setBox(b);
+      const hits = within(b);
+      setSelected([...base.filter((r) => !hits.some((x) => x.id === r.id)), ...hits]);
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      setBox(null);
+      if (!moved && !add) setSelected([]); // a click on empty timeline clears the selection
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
   };
 
   const drag = (e: React.PointerEvent, onMove: (dxSeconds: number, ev: PointerEvent) => void, onEnd?: (ev: PointerEvent, before: Project) => void) => {
@@ -585,7 +1008,7 @@ export function OwnEditor() {
     const cur = pRef.current;
     const kind = kindOf(ref, cur);
     const rk = kindOfRow(cur, row);
-    const reason = rk === "new" || !kind ? null : refuseReason(kind, rk);
+    const reason = rk === "new" || !kind ? null : locked(row) ? LOCKED : refuseReason(kind, rk);
     if (reason) {
       h.apply(before); // undo the drag
       setNotice(reason);
@@ -629,6 +1052,7 @@ export function OwnEditor() {
   /** Main-track clip: drop on the main track to reorder (clips stay joined), or on another track to move it there. */
   const grabClip = (e: React.PointerEvent, i: number) => {
     const ref: Ref = { type: "clip", id: p.clips[i]!.id };
+    if (pick(e, ref)) return;
     setSel(ref);
     drag(e, (_dx, ev) => showHover(ref, ev), (ev, before) => {
       if (Math.abs(ev.clientX - e.clientX) < 6 && Math.abs(ev.clientY - e.clientY) < 6) return;
@@ -645,6 +1069,7 @@ export function OwnEditor() {
   /** Item on a visual track: slide in time while dragging; drop on another row to move it there. */
   const grabOverlay = (e: React.PointerEvent, o: Overlay) => {
     const ref: Ref = { type: "overlay", id: o.id };
+    if (pick(e, ref)) return;
     setSel(ref);
     const len = o.end - o.start;
     drag(e, (dx, ev) => {
@@ -661,6 +1086,7 @@ export function OwnEditor() {
   };
   const grabAudio = (e: React.PointerEvent, a: AudioItem) => {
     const ref: Ref = { type: "audio", id: a.id };
+    if (pick(e, ref)) return;
     setSel(ref);
     drag(e, (dx, ev) => {
       patchAudio(a.id, { start: Math.max(0, snap(a.start + dx, a.id)) }, true);
@@ -675,6 +1101,7 @@ export function OwnEditor() {
   };
 
   const trimClip = (e: React.PointerEvent, c: Clip, i: number, edge: "in" | "out") => {
+    if (lockedEdge(e, "main")) return;
     const start = starts[i] ?? 0;
     drag(e, (dx) => {
       if (edge === "out") {
@@ -688,6 +1115,7 @@ export function OwnEditor() {
     });
   };
   const trimOverlay = (e: React.PointerEvent, o: Overlay, edge: "start" | "end") => {
+    if (lockedEdge(e, o.track)) return;
     setSel({ type: "overlay", id: o.id });
     drag(e, (dx) => {
       if (edge === "start") {
@@ -702,6 +1130,7 @@ export function OwnEditor() {
     });
   };
   const trimAudio = (e: React.PointerEvent, a: AudioItem, edge: "start" | "end") => {
+    if (lockedEdge(e, a.track)) return;
     setSel({ type: "audio", id: a.id });
     drag(e, (dx) => {
       if (edge === "start") {
@@ -714,6 +1143,8 @@ export function OwnEditor() {
     });
   };
   const scrub = (e: React.PointerEvent) => {
+    e.stopPropagation();
+    setLibPreview(null);
     seek(timeAtPointer(e.clientX));
     const move = (ev: PointerEvent) => seek(timeAtPointer(ev.clientX));
     const up = () => (window.removeEventListener("pointermove", move), window.removeEventListener("pointerup", up));
@@ -725,7 +1156,7 @@ export function OwnEditor() {
    * Drag from the Library: press, move onto a track, release. A press without movement is a click (adds it where
    * it usually goes). Pointer events, not HTML5 drag, so it behaves like the timeline drags and works on touch.
    */
-  const grabLibrary = (e: React.PointerEvent, m: { name: string; kind: Media["kind"] }) => {
+  const grabLibrary = (e: React.PointerEvent, m: { name: string; kind: Media["kind"]; own: boolean }) => {
     e.preventDefault();
     const x0 = e.clientX;
     const y0 = e.clientY;
@@ -743,8 +1174,8 @@ export function OwnEditor() {
       setGhost(null);
       setHover(null);
       try {
-        const media = await mediaFor(m.name, m.kind);
-        if (!moved) return void addDefault(media);
+        const media = await mediaFor(m.name, m.kind, m.own);
+        if (!moved) return previewLibrary(media);
         const row = rowAtPointer(ev.clientX, ev.clientY);
         if (!row) return;
         const at = timeAtPointer(ev.clientX);
@@ -763,8 +1194,24 @@ export function OwnEditor() {
   const [progress, setProgress] = useState(0);
   const [results, setResults] = useState<(ExportResult | { engine: string; error: string })[]>([]);
   const [lastUrl, setLastUrl] = useState<string | null>(null);
+  const resultRef = useRef<HTMLVideoElement>(null);
+  const [playNonce, setPlayNonce] = useState(0);
+  // "Play" on a result: show that export and start it from the beginning
+  useEffect(() => {
+    const v = resultRef.current;
+    if (!playNonce || !v) return;
+    v.currentTime = 0;
+    void v.play().catch(() => setNotice("The browser did not start playback; press play on the video."));
+  }, [playNonce]);
   const engines = { mediabunny: exportMediabunny, wasm: exportFfmpegWasm, server: exportServer } as const;
   const runExport = async (key: keyof typeof engines, force = false) => {
+    const lost = missingFiles(pRef.current, new Set(libRef.current.map((m) => m.src)));
+    if (lost.length) {
+      const err = { engine: key, error: "Cannot export: " + missingMessage(lost) };
+      setResults((prev) => [...prev, err]);
+      setNotice(missingMessage(lost));
+      return err;
+    }
     const length = totalDuration(pRef.current);
     if (key !== "server" && length > BROWSER_EXPORT_MAX_SECONDS && !force) {
       setNotice(`This edit is ${Math.round(length)} s long. Edits over ${BROWSER_EXPORT_MAX_SECONDS} s are exported on the server, which is several times faster for long videos.`);
@@ -818,28 +1265,40 @@ export function OwnEditor() {
   const audioTracks = p.tracks.filter((x) => x.kind === "audio");
   const rowClass = (row: RowId, extra = "") =>
     `track ${extra} ${hover?.row === row ? (hover.ok ? "drop-ok" : "drop-bad") : ""}`;
-  const rowEvents = (row: RowId) => ({ "data-row": row });
-  const libItems: { name: string; kind: Media["kind"]; own: boolean }[] = [
-    ...BUILT_IN.map((m) => ({ name: m.name, kind: m.kind, own: false })),
-    ...library.map((m) => ({ name: m.name, kind: m.kind, own: true })),
+  const rowEvents = (row: RowId) => ({ "data-row": row, onPointerDown: startBox });
+  const stateOf = (row: RowId): TrackState => (row === "main" ? p.main ?? {} : p.tracks.find((x) => x.id === row) ?? {});
+  const rowState = (row: RowId) => `${stateOf(row).locked ? "is-locked" : ""} ${stateOf(row).hidden ? "is-hidden" : ""} ${stateOf(row).muted ? "is-muted" : ""}`;
+  const libItems: { name: string; kind: Media["kind"]; own: boolean; src: string }[] = [
+    ...BUILT_IN.map((m) => ({ name: m.name, kind: m.kind, own: false, src: `/media/${m.name}` })),
+    ...library.map((m) => ({ name: m.name, kind: m.kind, own: true, src: m.src })),
   ];
 
   return (
     <div className="own">
       <div className="bar">
         <button onClick={() => h.commit(splitAt(p, t))} title="S">Split at playhead</button>
-        <button onClick={removeSelected} disabled={!sel}>Delete</button>
+        <button onClick={removeSelected} disabled={!selected.length}>{selected.length > 1 ? `Delete ${selected.length}` : "Delete"}</button>
         <button onClick={h.undo} disabled={!h.canUndo}>Undo</button>
         <button onClick={h.redo} disabled={!h.canRedo}>Redo</button>
         <button onClick={() => (setPlaying(false), setSel(null), h.commit(SAMPLE), seek(0))} title="Back to the sample edit (Undo brings your edit back)">Reset</button>
         <span className="sep" />
         <button onClick={addText}>+ Text</button>
+        <button onClick={addCaption} title="A caption line at the playhead, on the Captions track">+ Caption</button>
         <label className="file">Import files
-          <input type="file" multiple accept="video/*,image/*,audio/*,.avi,.mkv,.mov,.m4v,.3gp" onChange={(e) => void onFiles(e.target.files)} />
+          <input type="file" multiple accept="video/*,image/*,audio/*,.avi,.mkv,.mov,.m4v,.3gp" onChange={(e) => { const picked = [...(e.target.files ?? [])]; e.target.value = ""; void onFiles(picked); }} />
         </label>
         <span className="saved">{h.savedAt ? `Draft saved ${h.savedAt}` : "Not saved yet"}</span>
       </div>
-      {notice && <div className="notice">{notice}</div>}
+      {/* floats over the page so a message never pushes the timeline down under the pointer */}
+      {notice && (
+        <div className="notice" role="status">
+          <span>{notice}</span>
+          <button onClick={() => setNotice(null)} aria-label="Dismiss message">×</button>
+        </div>
+      )}
+      {box && (
+        <div className="marquee" style={{ left: Math.min(box.x0, box.x1), top: Math.min(box.y0, box.y1), width: Math.abs(box.x1 - box.x0), height: Math.abs(box.y1 - box.y0) }} />
+      )}
       {ghost && (
         <div className={`ghost ${hover && !hover.ok ? "bad" : ""}`} style={{ left: ghost.x + 12, top: ghost.y + 8 }}>
           <span className={`tag ${ghost.kind}`}>{ghost.kind}</span> {ghost.name}
@@ -863,26 +1322,65 @@ export function OwnEditor() {
               type="file"
               multiple
               accept={libTab === "media" ? "video/*,image/*,.avi,.mkv,.mov,.m4v,.3gp" : "audio/*,.mp3,.wav,.ogg,.m4a,.aac,.flac,.opus"}
-              onChange={(e) => void onFiles(e.target.files)}
+              onChange={(e) => { const picked = [...(e.target.files ?? [])]; e.target.value = ""; void onFiles(picked); }}
             />
           </label>
           <div className="lib-list">
+            {Object.entries(pending).filter(([, x]) => (x.kind === "audio") === (libTab === "audio")).map(([name, x]) => (
+              <div key={`pending:${name}`} className="lib pending" aria-busy="true">
+                <span className="spinner" aria-hidden="true" /> <span className="lib-name">{name}</span> <span className="step">{x.step}</span>
+              </div>
+            ))}
             {libItems.filter((m) => (m.kind === "audio") === (libTab === "audio")).map((m) => (
-              <button key={m.name} className="lib" title={m.name} onPointerDown={(e) => grabLibrary(e, m)}>
-                <span className={`tag ${m.kind}`}>{m.kind}</span> {m.name}
-              </button>
+              <div key={`${m.own ? "own" : "builtin"}:${m.name}`} className={`lib ${m.own ? "own" : ""} ${libPreview?.name === m.name ? "playing" : ""}`} role="button" tabIndex={0} title={`${m.name}: click to play, drag onto the timeline`}
+                onPointerDown={(e) => grabLibrary(e, m)}
+                onKeyDown={(e) => e.key === "Enter" && void mediaFor(m.name, m.kind, m.own).then(previewLibrary)}>
+                <span className={`tag ${m.kind}`}>{m.kind}</span> <span className="lib-name">{m.name}</span>
+                {usesOf(m.src, p) > 0 && <span className="added" title={`Used ${usesOf(m.src, p)} time(s) on the timeline`}>Added</span>}
+                <button className="lib-add" aria-label={`Add ${m.name} at the playhead`} title="Add at the playhead"
+                  onPointerDown={(e) => e.stopPropagation()}
+                  onClick={() => void mediaFor(m.name, m.kind, m.own).then(addAtPlayhead).catch((err: unknown) => setNotice(`${m.name}: ${String(err)}`))}>+</button>
+                {m.own && (
+                  <button className="lib-remove" aria-label={`Remove ${m.name} from the Library`} title="Remove from the Library"
+                    onPointerDown={(e) => e.stopPropagation()}
+                    onClick={() => { const mine = library.find((x) => x.src === m.src); if (mine) removeFromLibrary(mine); }}>×</button>
+                )}
+              </div>
             ))}
           </div>
-          <p className="hint">{libTab === "media" ? "Drag onto Main or a track above it, or click to add." : "Drag onto an audio track or New, or click to add."}</p>
+          <p className="hint">Click to play. Drag onto the timeline, or press + to add at the playhead.</p>
         </aside>
 
         <div className="player" ref={playerRef}>
           <div className="preview">
-            <canvas ref={canvasRef} width={W} height={H} onPointerDown={dragOnPreview} style={{ aspectRatio: `${W} / ${H}` }} />
+            <canvas ref={canvasRef} width={W} height={H} onPointerDown={pressPreview} style={{ aspectRatio: `${W} / ${H}` }} />
+            {selBox && sel && (
+              <div className="tbox" style={{ left: selBox.left, top: selBox.top, width: selBox.width, height: selBox.height, transform: `rotate(${selBox.rot}deg)` }}
+                onPointerDown={(e) => transformItem(e, sel, "move")}>
+                {(["nw", "ne", "sw", "se"] as const).map((c) => (
+                  <span key={c} className={`corner ${c}`} title="Drag to resize" onPointerDown={(e) => transformItem(e, sel, "scale")} />
+                ))}
+                <span className="turn" title="Drag to rotate (hold Shift for 15° steps)" onPointerDown={(e) => transformItem(e, sel, "turn")}>⟳</span>
+              </div>
+            )}
+            {libPreview && (
+              <div className="lib-preview">
+                {libPreview.kind === "video" && <video key={libPreview.src} src={libPreview.src} controls autoPlay playsInline />}
+                {libPreview.kind === "image" && <img src={libPreview.src} alt={libPreview.name} />}
+                {libPreview.kind === "audio" && (
+                  <div className="audio-prev"><b>{libPreview.name}</b><audio key={libPreview.src} src={libPreview.src} controls autoPlay /></div>
+                )}
+                <div className="lib-preview-bar">
+                  <span />
+                  <button onClick={() => addAtPlayhead(libPreview)}>+ Add at playhead</button>
+                  <button onClick={() => setLibPreview(null)} aria-label="Close the Library preview">Close</button>
+                </div>
+              </div>
+            )}
           </div>
           <div className="player-bar">
             <span className="time"><b>{fmt(t)}</b> / {fmt(total)}</span>
-            <button className="play" onClick={() => setPlaying((v) => !v)} aria-label={playing ? "Pause" : "Play"} title="Space">
+            <button className="play" onClick={() => (setLibPreview(null), setPlaying((v) => !v))} aria-label={playing ? "Pause" : "Play"} title="Space">
               {playing ? "❚❚" : "▶"}
             </button>
             <div className="player-right">
@@ -930,7 +1428,10 @@ export function OwnEditor() {
                   </button>
                 ))}
               </div>
-              <p className="hint">Main track. Drag it up to a track above to lay it over other clips.</p>
+              <label>Size {Math.round((selClip.scale ?? 1) * 100)}%<input type="range" min={0.1} max={4} step={0.01} value={selClip.scale ?? 1} onChange={(e) => patchClip(selClip.id, { scale: Number(e.target.value) })} /></label>
+              <label>Rotation {Math.round(selClip.rotation ?? 0)}°<input type="range" min={-180} max={180} step={1} value={selClip.rotation ?? 0} onChange={(e) => patchClip(selClip.id, { rotation: Number(e.target.value) })} /></label>
+              <button onClick={() => patchClip(selClip.id, { scale: undefined, x: undefined, y: undefined, rotation: undefined })}>Reset size, position and rotation</button>
+              <p className="hint">Drag it on the preview to move, its corners to resize, the round handle to rotate.</p>
             </div>
           )}
           {selOverlay?.kind === "text" && (
@@ -945,14 +1446,31 @@ export function OwnEditor() {
                 <p className="hint">This font has no Hindi letters, so {fontFor(selOverlay.text, selOverlay.font).label} is used for this title.</p>
               )}
               <label>Size<input type="range" min={16} max={120} value={selOverlay.fontSize} onChange={(e) => patchOverlay(selOverlay.id, { fontSize: Number(e.target.value) })} /></label>
+              <label>Rotation {Math.round(selOverlay.rotation ?? 0)}°<input type="range" min={-180} max={180} step={1} value={selOverlay.rotation ?? 0} onChange={(e) => patchOverlay(selOverlay.id, { rotation: Number(e.target.value) })} /></label>
               <label>Colour<input type="color" value={selOverlay.color} onChange={(e) => patchOverlay(selOverlay.id, { color: e.target.value.toUpperCase() })} /></label>
-              <p className="hint">Drag on the preview to position.</p>
+              <label className="row"><input type="checkbox" checked={!!selOverlay.bg} onChange={(e) => patchOverlay(selOverlay.id, e.target.checked ? { bg: "#000000", bgOpacity: 0.6 } : { bg: undefined })} /> Background box</label>
+              {selOverlay.bg && (
+                <div className="pair">
+                  <label>Box colour<input type="color" value={selOverlay.bg} onChange={(e) => patchOverlay(selOverlay.id, { bg: e.target.value.toUpperCase() })} /></label>
+                  <label>Opacity<input type="range" min={0.1} max={1} step={0.05} value={selOverlay.bgOpacity ?? 0.6} onChange={(e) => patchOverlay(selOverlay.id, { bgOpacity: Number(e.target.value) })} /></label>
+                </div>
+              )}
+              <div className="seg" role="group" aria-label="Position">
+                <span>Position (or drag it on the preview)</span>
+                {([["Top", 0.12], ["Middle", 0.5], ["Bottom", 0.86]] as const).map(([label, y]) => (
+                  <button key={label} className={Math.abs(selOverlay.y - y) < 0.01 && Math.abs(selOverlay.x - 0.5) < 0.01 ? "on" : ""} onClick={() => patchOverlay(selOverlay.id, { x: 0.5, y })}>{label}</button>
+                ))}
+              </div>
+              {p.tracks.find((x) => x.id === selOverlay.track)?.role === "captions" && (
+                <button onClick={() => applyStyleToCaptions(selOverlay)}>Apply this style to all captions</button>
+              )}
             </div>
           )}
           {(selOverlay?.kind === "image" || selOverlay?.kind === "video") && (
             <div className="form">
               {selOverlay.kind === "video" && <b>{selOverlay.name}</b>}
-              <label>Width<input type="range" min={0.05} max={1} step={0.01} value={selOverlay.width} onChange={(e) => patchOverlay(selOverlay.id, { width: Number(e.target.value) })} /></label>
+              <label>Size {Math.round(selOverlay.width * 100)}% of the frame width<input type="range" min={0.02} max={2} step={0.01} value={selOverlay.width} onChange={(e) => patchOverlay(selOverlay.id, { width: Number(e.target.value) })} /></label>
+              <label>Rotation {Math.round(selOverlay.rotation ?? 0)}°<input type="range" min={-180} max={180} step={1} value={selOverlay.rotation ?? 0} onChange={(e) => patchOverlay(selOverlay.id, { rotation: Number(e.target.value) })} /></label>
               {selOverlay.kind === "video" && (
                 <label className="row"><input type="checkbox" checked={selOverlay.muted} onChange={(e) => patchOverlay(selOverlay.id, { muted: e.target.checked })} /> Mute its sound</label>
               )}
@@ -967,6 +1485,27 @@ export function OwnEditor() {
             </div>
           )}
           {!selClip && !selOverlay && !selAudio && <p className="hint">Select something on the timeline.</p>}
+          <h4>Captions</h4>
+          <div className="form captions">
+            <div className="pair">
+              <button onClick={addCaption}>+ Caption</button>
+              <label className="file">Import .srt
+                <input type="file" accept=".srt,.vtt,text/vtt" onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; void importSubtitles(f); }} />
+              </label>
+            </div>
+            {captionsOf(p).length === 0 ? (
+              <p className="hint">No captions yet. Add one at the playhead, or import an .srt or .vtt file.</p>
+            ) : (
+              <ol className="cap-list">
+                {captionsOf(p).map((c) => (
+                  <li key={c.id} className={isSel(c.id) ? "sel" : ""}>
+                    <button className="cap-time" title="Go to this caption" onClick={() => (setSel({ type: "overlay", id: c.id }), seek(c.start))}>{short(c.start)}</button>
+                    <input aria-label={`Caption at ${short(c.start)}`} value={c.text} onFocus={() => (setSel({ type: "overlay", id: c.id }), seek(c.start))} onChange={(e) => patchOverlay(c.id, { text: e.target.value })} />
+                  </li>
+                ))}
+              </ol>
+            )}
+          </div>
           <h4>Audio</h4>
           <div className="form">
             <label>Sound of the video clips<input type="range" min={0} max={1} step={0.05} value={p.originalVolume} onChange={(e) => h.commit({ ...p, originalVolume: Number(e.target.value) })} /></label>
@@ -982,9 +1521,9 @@ export function OwnEditor() {
       <div className="tl-wrap">
       <div className="tl-labels">
         <div className="ruler" />
-        {visualTracks.map((tr, n) => <div key={tr.id} className="track">{`Track ${visualTracks.length - n + 1}`}</div>)}
-        <div className="track main">Main</div>
-        {audioTracks.map((tr, n) => <div key={tr.id} className="track audio">{`Audio ${n + 1}`}</div>)}
+        {visualTracks.map((tr, n) => <TrackHead key={tr.id} name={tr.role === "captions" ? "Captions" : `Track ${visualTracks.length - n + 1}`} kind="visual" state={tr} onToggle={(k) => toggleTrack(tr.id, k)} />)}
+        <TrackHead name="Main" kind="main" state={p.main ?? {}} onToggle={(k) => toggleTrack("main", k)} />
+        {audioTracks.map((tr, n) => <TrackHead key={tr.id} name={`Audio ${n + 1}`} kind="audio" state={tr} onToggle={(k) => toggleTrack(tr.id, k)} />)}
         <div className="track new">New</div>
       </div>
       <div className="tl-scroll">
@@ -995,9 +1534,9 @@ export function OwnEditor() {
             ))}
           </div>
           {visualTracks.map((tr, n) => (
-            <div key={tr.id} className={rowClass(tr.id, "visual")} data-label={`Track ${visualTracks.length - n + 1}`} {...rowEvents(tr.id)}>
+            <div key={tr.id} className={rowClass(tr.id, `visual ${rowState(tr.id)}`)} data-label={`Track ${visualTracks.length - n + 1}`} {...rowEvents(tr.id)}>
               {p.overlays.filter((o) => o.track === tr.id).map((o) => (
-                <div key={o.id} className={`clip ${o.kind} ${sel?.id === o.id ? "sel" : ""}`} style={{ left: o.start * zoom, width: (o.end - o.start) * zoom }} onPointerDown={(e) => grabOverlay(e, o)}>
+                <div key={o.id} data-ref={`overlay:${o.id}`} className={`clip ${o.kind} ${isSel(o.id) ? "sel" : ""} ${o.kind !== "text" && missing(o.src) ? "lost" : ""}`} style={{ left: o.start * zoom, width: (o.end - o.start) * zoom }} onPointerDown={(e) => grabOverlay(e, o)}>
                   <i className="h l" onPointerDown={(e) => trimOverlay(e, o, "start")} />
                   <span>{o.kind === "text" ? o.text : o.kind === "video" ? o.name : (o as ImageOverlay).src.split("/").pop()}</span>
                   <i className="h r" onPointerDown={(e) => trimOverlay(e, o, "end")} />
@@ -1005,9 +1544,9 @@ export function OwnEditor() {
               ))}
             </div>
           ))}
-          <div className={rowClass("main", "main")} data-label="Main" {...rowEvents("main")}>
+          <div className={rowClass("main", `main ${rowState("main")}`)} data-label="Main" {...rowEvents("main")}>
             {p.clips.map((c, i) => (
-              <div key={c.id} className={`clip ${c.kind === "image" ? "image" : "video"} ${sel?.id === c.id ? "sel" : ""}`} style={{ left: (starts[i] ?? 0) * zoom, width: clipLen(c) * zoom }} onPointerDown={(e) => grabClip(e, i)}>
+              <div key={c.id} data-ref={`clip:${c.id}`} className={`clip ${c.kind === "image" ? "image" : "video"} ${isSel(c.id) ? "sel" : ""} ${missing(c.src) ? "lost" : ""}`} style={{ left: (starts[i] ?? 0) * zoom, width: clipLen(c) * zoom }} onPointerDown={(e) => grabClip(e, i)}>
                 <i className="h l" onPointerDown={(e) => trimClip(e, c, i, "in")} />
                 <span>{c.muted ? "(muted) " : ""}{c.name}</span>
                 <i className="h r" onPointerDown={(e) => trimClip(e, c, i, "out")} />
@@ -1016,9 +1555,9 @@ export function OwnEditor() {
             {mainLen === 0 && <span className="empty">Drop video or images here</span>}
           </div>
           {audioTracks.map((tr, n) => (
-            <div key={tr.id} className={rowClass(tr.id, "audio")} data-label={`Audio ${n + 1}`} {...rowEvents(tr.id)}>
+            <div key={tr.id} className={rowClass(tr.id, `audio ${rowState(tr.id)}`)} data-label={`Audio ${n + 1}`} {...rowEvents(tr.id)}>
               {p.audios.filter((a) => a.track === tr.id).map((a) => (
-                <div key={a.id} className={`clip audio ${sel?.id === a.id ? "sel" : ""}`} style={{ left: a.start * zoom, width: audioLen(a) * zoom }} onPointerDown={(e) => grabAudio(e, a)}>
+                <div key={a.id} data-ref={`audio:${a.id}`} className={`clip audio ${isSel(a.id) ? "sel" : ""} ${missing(a.src) ? "lost" : ""}`} style={{ left: a.start * zoom, width: audioLen(a) * zoom }} onPointerDown={(e) => grabAudio(e, a)}>
                   <i className="h l" onPointerDown={(e) => trimAudio(e, a, "start")} />
                   <span>{a.name} ({Math.round(a.volume * 100)}%)</span>
                   <i className="h r" onPointerDown={(e) => trimAudio(e, a, "end")} />
@@ -1029,7 +1568,9 @@ export function OwnEditor() {
           <div className={rowClass("new", "new")} data-label="New" {...rowEvents("new")}>
             <span className="empty">Drop here for a new track</span>
           </div>
-          <div className="playhead" style={{ left: t * zoom }} />
+          <div className="playhead" style={{ left: t * zoom }}>
+            <span className="knob" onPointerDown={scrub} title="Drag to move the playhead" />
+          </div>
         </div>
       </div>
       </div>
@@ -1057,12 +1598,12 @@ export function OwnEditor() {
                 <tr key={i}>
                   <td>{r.engine}</td><td>{r.width}x{r.height}, {r.duration.toFixed(1)} s</td><td>{(r.ms / 1000).toFixed(2)} s</td>
                   <td>{(r.duration / (r.ms / 1000)).toFixed(1)}x realtime</td><td>{(r.bytes / 1024 / 1024).toFixed(2)} MB</td>
-                  <td><button onClick={() => setLastUrl(r.url)}>Play</button> <a href={r.url} download={`export-${i}.mp4`}>Download</a></td>
+                  <td><button onClick={() => (setLastUrl(r.url), setPlayNonce((n) => n + 1))}>Play</button> <a href={r.url} download={`export-${i}.mp4`}>Download</a></td>
                 </tr>
               ))}
             </tbody>
           </table>
-          {lastUrl && <video key={lastUrl} src={lastUrl} controls className="result-video" />}
+          {lastUrl && <video key={lastUrl} ref={resultRef} src={lastUrl} controls playsInline className="result-video" />}
         </div>
       )}
     </div>

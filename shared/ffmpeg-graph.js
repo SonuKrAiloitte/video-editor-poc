@@ -3,7 +3,7 @@
 // One builder, two runtimes: this is what keeps server and browser exports identical.
 
 import { fontFor } from "./fonts.js";
-import { audioLen, frameSizeFor, layers, mainDuration, normalizeProject, projectDuration, resolveAspect } from "./model.js";
+import { applyTrackStates, audioLen, frameSizeFor, layers, mainDuration, normalizeProject, projectDuration, resolveAspect } from "./model.js";
 
 export { projectDuration };
 
@@ -17,6 +17,13 @@ const even = (x) => Math.max(2, Math.round(x / 2) * 2);
 // FFmpeg lowers a mono source by 3 dB when it widens it to stereo; browsers do not.
 // Copy the single channel to both sides instead, so server and browser exports are equally loud.
 const widen = (channels) => (channels === 1 ? "pan=stereo|c0=c0|c1=c0," : "");
+/** FFmpeg's rotate filter for a turn in degrees, keeping the corners transparent and the whole picture */
+const turn = (deg) => {
+  if (!deg) return "";
+  const a = n((deg * Math.PI) / 180);
+  return `,format=rgba,rotate=${a}:c=none:ow=rotw(${a}):oh=roth(${a})`;
+};
+const plain = (c) => (c.scale ?? 1) === 1 && (c.x ?? 0.5) === 0.5 && (c.y ?? 0.5) === 0.5 && !c.rotation;
 const toStereo = (channels) => `${widen(channels)}aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo`;
 
 /**
@@ -29,7 +36,7 @@ const toStereo = (channels) => `${widen(channels)}aresample=48000,aformat=sample
  * @param opts.seek     "input" (default) | "filter"
  */
 export function buildFfmpegArgs(input, opts) {
-  const project = normalizeProject(input);
+  const project = applyTrackStates(normalizeProject(input));
   const [W, H] = frameSizeFor(resolveAspect(project), opts.height);
   const total = projectDuration(project);
   const main = mainDuration(project);
@@ -58,7 +65,17 @@ export function buildFfmpegArgs(input, opts) {
     if (inputSeek) vi = addInput(c.src, still ? 0 : c.in, len, still);
     else (args.push("-i", opts.resolve(c.src)), (vi = idx++));
     const cut = inputSeek ? `end=${len}` : `start=${n(c.in)}:end=${n(c.out)}`;
-    f.push(
+    if (c.hidden) f.push(`color=c=black:s=${W}x${H}:r=30:d=${len},format=yuv420p,setsar=1[v${vi}]`); // hidden main track
+    else if (!plain(c)) {
+      // its own size, position and turn: fit (or fill) a box `scale` times the frame, turn it, place it on black
+      const s = c.scale ?? 1;
+      f.push(
+        `[${vi}:v]trim=${cut},setpts=PTS-STARTPTS,fps=30,` +
+          `scale=${even(W * s)}:${even(H * s)}:force_original_aspect_ratio=${c.fit === "fill" ? "increase" : "decrease"}:force_divisible_by=2,setsar=1${turn(c.rotation)}[m${vi}]`,
+      );
+      f.push(`color=c=black:s=${W}x${H}:r=30:d=${len}[b${vi}]`);
+      f.push(`[b${vi}][m${vi}]overlay=x=${n(c.x ?? 0.5)}*W-w/2:y=${n(c.y ?? 0.5)}*H-h/2:shortest=1,format=yuv420p,setsar=1[v${vi}]`);
+    } else f.push(
       `[${vi}:v]trim=${cut},setpts=PTS-STARTPTS,` +
         // fit: the whole picture, black bars where the shapes differ (CapCut's default); fill: crop to cover the frame
         (c.fit === "fill"
@@ -106,18 +123,19 @@ export function buildFfmpegArgs(input, opts) {
       const fontfile = typeof opts.font === "function" ? opts.font(file) : opts.font;
       f.push(
         `[${last}]drawtext=expansion=none:fontfile=${fontfile}:text='${esc(o.text)}':fontsize=${size}:fontcolor=${o.color.replace("#", "0x")}:` +
+          (o.bg ? `box=1:boxcolor=${o.bg.replace("#", "0x")}@${n(o.bgOpacity ?? 0.6)}:boxborderw=${Math.round(size * 0.3)}:` : "") +
           `x=${n(o.x)}*w-text_w/2:y=${n(o.y)}*h-text_h/2:${gate}[${out}]`,
       );
     } else if (o.kind === "image") {
       const ii = idx++;
       args.push("-i", opts.resolve(o.src));
-      f.push(`[${ii}:v]scale=${Math.round(o.width * W)}:-1[img${ii}]`);
+      f.push(`[${ii}:v]scale=${Math.round(o.width * W)}:-1${turn(o.rotation)}[img${ii}]`);
       f.push(`[${last}][img${ii}]overlay=x=${n(o.x)}*W-w/2:y=${n(o.y)}*H-h/2:${gate}[${out}]`);
     } else {
       // video on an upper track: its own clock starts at o.start on the timeline
       const len = n(o.end - o.start);
       const ii = addInput(o.src, o.in, len);
-      f.push(`[${ii}:v]trim=end=${len},setpts=PTS-STARTPTS+${n(o.start)}/TB,scale=${even(o.width * W)}:-2,setsar=1[pip${ii}]`);
+      f.push(`[${ii}:v]trim=end=${len},setpts=PTS-STARTPTS+${n(o.start)}/TB,scale=${even(o.width * W)}:-2,setsar=1${turn(o.rotation)}[pip${ii}]`);
       f.push(`[${last}][pip${ii}]overlay=x=${n(o.x)}*W-w/2:y=${n(o.y)}*H-h/2:eof_action=pass:${gate}[${out}]`);
       if (o.hasAudio !== false && !o.muted) {
         const ms = Math.round(o.start * 1000);
@@ -126,6 +144,16 @@ export function buildFfmpegArgs(input, opts) {
       }
     }
     last = out;
+  }
+
+  // 2b. sound of videos on hidden tracks still plays
+  for (const o of project.overlays) {
+    if (o.kind !== "video" || !o.hidden || o.muted || o.hasAudio === false) continue;
+    const len = n(o.end - o.start);
+    const ii = addInput(o.src, o.in, len);
+    const ms = Math.round(o.start * 1000);
+    f.push(`[${ii}:a]atrim=end=${len},asetpts=PTS-STARTPTS,volume=${n(project.originalVolume)},${toStereo(o.channels)},adelay=delays=${ms}:all=1[pa${ii}]`);
+    mix.push(`[pa${ii}]`);
   }
 
   // 3. audio tracks: each clip trimmed, moved to its start and mixed under the main track's sound

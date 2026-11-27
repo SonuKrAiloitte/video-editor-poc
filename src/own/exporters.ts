@@ -13,7 +13,8 @@ import coreURL from "@ffmpeg/core?url";
 import wasmURL from "@ffmpeg/core/wasm?url";
 import { buildFfmpegArgs } from "../../shared/ffmpeg-graph.js";
 import { fontFor, needsRaster } from "../../shared/fonts.js";
-import { drawMain, drawOverlays, getImage, preloadOverlayAssets, rasteriseTitle } from "./compose";
+import { drawMain, drawOverlays, drawTurned, getImage, isPlain, mainRect, preloadOverlayAssets, rasteriseTitle } from "./compose";
+import { applyTrackStates } from "../../shared/model.js";
 import { clipLen, clipStarts, frameSize, overlayOut, totalDuration, type Project, type VideoOverlay } from "./project";
 
 export interface ExportResult {
@@ -36,9 +37,9 @@ const FPS = 30;
 async function withRasterTitles(p: Project, height: 720 | 1080, store: (png: Blob) => Promise<string>): Promise<Project> {
   const [W, H] = frameSize(p, height);
   const overlays = await Promise.all(p.overlays.map(async (o) => {
-    if (o.kind !== "text" || !needsRaster(o.text)) return o;
+    if (o.kind !== "text" || (!needsRaster(o.text) && !o.rotation)) return o;
     const { blob, width } = await rasteriseTitle(o, W, H);
-    return { id: o.id, track: o.track, kind: "image" as const, src: await store(blob), width: width / W, x: o.x, y: o.y, start: o.start, end: o.end };
+    return { id: o.id, track: o.track, kind: "image" as const, src: await store(blob), width: width / W, x: o.x, y: o.y, start: o.start, end: o.end, rotation: o.rotation };
   }));
   return { ...p, overlays };
 }
@@ -49,10 +50,13 @@ const fetchBlob = (src: string) => fetch(src).then((r) => r.blob());
 interface FrameStream {
   iter: AsyncIterator<WrappedCanvas | null>;
   cur: WrappedCanvas | null;
+  /** where a main-track clip with its own size, position or turn is drawn */
+  rect?: { cx: number; cy: number; w: number; h: number };
 }
 
-export async function exportMediabunny(p: Project, height: 720 | 1080, onProgress: Progress): Promise<ExportResult> {
+export async function exportMediabunny(edit: Project, height: 720 | 1080, onProgress: Progress): Promise<ExportResult> {
   const t0 = performance.now();
+  const p = applyTrackStates(edit);
   const [W, H] = frameSize(p, height);
   const total = totalDuration(p);
   await preloadOverlayAssets(p);
@@ -102,15 +106,17 @@ export async function exportMediabunny(p: Project, height: 720 | 1080, onProgres
 
   // video: every output frame is drawn from scratch: main track, then each visual track from the lowest up
   const streams = new Map<string, FrameStream>();
-  const open = async (id: string, name: string, src: string, from: number, frames: number, size: { width: number; height?: number; fit?: "cover" | "contain" }) => {
+  type Size = { width: number; height?: number; fit?: "cover" | "contain" | "fill" };
+  const open = async (id: string, name: string, src: string, from: number, frames: number, sizeFor: (sw: number, sh: number) => Size & { rect?: FrameStream["rect"] }) => {
     const input = new Input({ source: new BlobSource(await blobOf(src)), formats: ALL_FORMATS });
     const track = await input.getPrimaryVideoTrack();
     if (!track) throw new Error(`${name}: no video track`);
     if (!(await track.canDecode())) throw new Error(`${name}: this browser cannot decode ${track.codec}`);
+    const { rect, ...size } = sizeFor(track.displayWidth, track.displayHeight);
     // poolSize: reuse a few canvases instead of allocating one per frame (matters on long exports)
     const sink = new CanvasSink(track, { ...size, poolSize: 3 });
     const stamps = Array.from({ length: frames }, (_, k) => from + k / FPS);
-    streams.set(id, { iter: sink.canvasesAtTimestamps(stamps)[Symbol.asyncIterator](), cur: null });
+    streams.set(id, { iter: sink.canvasesAtTimestamps(stamps)[Symbol.asyncIterator](), cur: null, rect });
   };
   const next = async (id: string) => {
     const s = streams.get(id);
@@ -125,7 +131,7 @@ export async function exportMediabunny(p: Project, height: 720 | 1080, onProgres
   };
   const F = (sec: number) => Math.round(sec * FPS);
   const main = p.clips.map((c, i) => ({ c, from: F(starts[i] ?? 0), to: F((starts[i] ?? 0) + clipLen(c)) }));
-  const pips = p.overlays.filter((o): o is VideoOverlay => o.kind === "video").map((o) => ({ o, from: F(o.start), to: F(o.end) }));
+  const pips = p.overlays.filter((o): o is VideoOverlay => o.kind === "video" && !o.hidden).map((o) => ({ o, from: F(o.start), to: F(o.end) }));
 
   const totalFrames = F(total);
   for (let f = 0; f < totalFrames; f++) {
@@ -133,21 +139,29 @@ export async function exportMediabunny(p: Project, height: 720 | 1080, onProgres
     ctx.fillStyle = "#000";
     ctx.fillRect(0, 0, W, H);
     const m = main.find((x) => f >= x.from && f < x.to);
-    if (m) {
+    if (m && !m.c.hidden) {
       if (m.c.kind === "image") {
         const img = getImage(m.c.src);
-        if (img) drawMain(ctx, m.c.fit, img, img.naturalWidth, img.naturalHeight, W, H);
+        if (img) drawMain(ctx, m.c, img, img.naturalWidth, img.naturalHeight, W, H);
       } else {
-        if (!streams.has(m.c.id)) await open(m.c.id, m.c.name, m.c.src, m.c.in + (f - m.from) / FPS, m.to - f, { width: W, height: H, fit: m.c.fit === "fill" ? "cover" : "contain" });
-        const fr = await next(m.c.id);
-        if (fr) ctx.drawImage(fr.canvas, 0, 0);
+        const c = m.c;
+        if (!streams.has(c.id)) await open(c.id, c.name, c.src, c.in + (f - m.from) / FPS, m.to - f, (sw, sh) => {
+          if (isPlain(c)) return { width: W, height: H, fit: c.fit === "fill" ? "cover" : "contain" };
+          // its own size, position or turn: decode at the size it is drawn, then place and turn it
+          const rect = mainRect(c, sw, sh, W, H);
+          return { width: Math.max(2, Math.round(rect.w)), height: Math.max(2, Math.round(rect.h)), fit: "fill", rect };
+        });
+        const fr = await next(c.id);
+        const rect = streams.get(c.id)?.rect;
+        if (fr && rect) drawTurned(ctx, fr.canvas, rect.cx, rect.cy, rect.w, rect.h, c.rotation);
+        else if (fr) ctx.drawImage(fr.canvas, 0, 0);
         if (f === m.to - 1) await close(m.c.id);
       }
     }
     const frames = new Map<string, WrappedCanvas>();
     for (const x of pips) {
       if (f < x.from || f >= x.to) continue;
-      if (!streams.has(x.o.id)) await open(x.o.id, x.o.name, x.o.src, x.o.in + (f - x.from) / FPS, x.to - f, { width: Math.max(2, Math.round((x.o.width * W) / 2) * 2) });
+      if (!streams.has(x.o.id)) await open(x.o.id, x.o.name, x.o.src, x.o.in + (f - x.from) / FPS, x.to - f, () => ({ width: Math.max(2, Math.round((x.o.width * W) / 2) * 2) }));
       const fr = await next(x.o.id);
       if (fr) frames.set(x.o.id, fr);
       if (f === x.to - 1) await close(x.o.id);

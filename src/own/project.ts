@@ -33,11 +33,27 @@ export interface Clip {
   ratio?: number;
   /** "fit" (default): the whole picture with black bars; "fill": cropped to cover the frame */
   fit?: "fit" | "fill";
+  /** size on top of fit/fill (1 = as fitted), centre as fractions of the frame, turn in degrees clockwise */
+  scale?: number;
+  x?: number;
+  y?: number;
+  rotation?: number;
+  /** set while exporting when the main track is hidden */
+  hidden?: boolean;
 }
 
-export interface Track {
+/** The buttons on a track header. Locked: nothing on it can be moved, trimmed or deleted. */
+export interface TrackState {
+  locked?: boolean;
+  hidden?: boolean;
+  muted?: boolean;
+}
+
+export interface Track extends TrackState {
   id: string;
   kind: TrackKind;
+  /** "captions": the visual track that holds the caption lines */
+  role?: "captions";
 }
 
 interface OverlayBase {
@@ -50,6 +66,10 @@ interface OverlayBase {
   /** when it is visible on the timeline, seconds */
   start: number;
   end: number;
+  /** turn in degrees, clockwise, about its centre */
+  rotation?: number;
+  /** set while exporting when its track is hidden */
+  hidden?: boolean;
 }
 export interface TextOverlay extends OverlayBase {
   kind: "text";
@@ -59,6 +79,10 @@ export interface TextOverlay extends OverlayBase {
   color: string;
   /** id from shared/fonts.js; missing means the default font */
   font?: string;
+  /** colour of a box behind the text ("#RRGGBB"); no box when missing */
+  bg?: string;
+  /** opacity of that box, 0..1 (default 0.6) */
+  bgOpacity?: number;
 }
 export interface ImageOverlay extends OverlayBase {
   kind: "image";
@@ -100,6 +124,8 @@ export interface Project {
   /** volume of the sound that comes with video clips */
   originalVolume: number;
   clips: Clip[];
+  /** the main track's buttons */
+  main?: TrackState;
   tracks: Track[];
   overlays: Overlay[];
   audios: AudioItem[];

@@ -62,7 +62,7 @@ export function projectDuration(p) {
  */
 export function layers(p) {
   const order = (p.tracks ?? []).filter((t) => t.kind === "visual").map((t) => t.id).reverse();
-  return [...(p.overlays ?? [])].sort((a, b) => order.indexOf(a.track) - order.indexOf(b.track) || a.start - b.start);
+  return [...(p.overlays ?? [])].filter((o) => !o.hidden).sort((a, b) => order.indexOf(a.track) - order.indexOf(b.track) || a.start - b.start);
 }
 
 /**
@@ -100,6 +100,27 @@ export function normalizeProject(p) {
   }
   const { music: _drop, ...rest } = p;
   return { ...rest, clips: (p.clips ?? []).map((c) => ({ kind: "video", ...c })), tracks, overlays, audios };
+}
+
+/**
+ * Apply the track buttons. Hidden: its pictures are not drawn (a hidden main track shows black), but its sound plays.
+ * Muted: its sound is silent. Items stay in place, so the length of the edit does not change.
+ * (Locked only matters while editing, so nothing to do here.)
+ */
+export function applyTrackStates(p) {
+  const byId = Object.fromEntries((p.tracks ?? []).map((t) => [t.id, t]));
+  const main = p.main ?? {};
+  if (!main.hidden && !main.muted && !(p.tracks ?? []).some((t) => t.hidden || t.muted)) return p;
+  return {
+    ...p,
+    clips: p.clips.map((c) => (main.hidden || main.muted ? { ...c, hidden: main.hidden || c.hidden, muted: main.muted || c.muted } : c)),
+    overlays: (p.overlays ?? []).map((o) => {
+      const t = byId[o.track];
+      if (!t?.hidden && !t?.muted) return o;
+      return { ...o, hidden: t.hidden || o.hidden, ...(o.kind === "video" ? { muted: t.muted || o.muted } : {}) };
+    }),
+    audios: (p.audios ?? []).map((a) => (byId[a.track]?.muted ? { ...a, volume: 0 } : a)),
+  };
 }
 
 /** Does [start, end) collide with another item on that track? */

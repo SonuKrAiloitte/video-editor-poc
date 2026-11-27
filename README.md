@@ -69,6 +69,33 @@ A drop on the wrong kind of track is refused with a message. A clip dropped wher
 
 Checked with mouse drags in Chrome: `scripts/timeline-dnd-check.mjs` (own core, 9 drags plus server and browser export) and `scripts/twick-dnd-check.mjs` (Twick, 8 checks). Twick's Library cards use the browser's built-in drag, which the test tool cannot perform with the mouse, so those drops are sent as the same drag events Chrome would send.
 
+## Editing (own core)
+
+- **Library:** a click plays the file in the player; nothing goes on the timeline until it is dragged there or its **+** is pressed. **+** puts video and images into Main at the playhead (the clip under the playhead is split there) and audio on a free audio track at the playhead.
+- **Selecting:** Ctrl, Shift or Cmd + click adds clips to the selection; dragging over empty timeline draws a box; Ctrl+A selects everything. Delete removes every selected clip.
+- **Track buttons:** each track header has lock, hide and mute (audio tracks: lock and mute). Locked: nothing on it can be moved, trimmed, deleted or dropped onto it. Hidden: its pictures are not drawn (a hidden Main shows black) but its sound plays. Muted: silent. Hide and mute apply to the preview and to all three exports.
+- **Playhead:** a handle on top of the playhead line can be dragged.
+- **Imported files are kept.** A file picked from the computer is a `blob:` link that dies when the page reloads; an edit saved with it then failed to export with "Failed to fetch". Imports are now stored on the render server (`/api/upload`) as soon as they are picked, and the Library list is saved too. While a file is checked, converted or saved, its own row in the Library says so; there is no pop-up. A clip still pointing at a lost file is marked red, and export stops with a message naming the file. Checked by `scripts/reload-check.mjs`.
+- **Library and timeline stay in step.** A Library file used on the timeline shows "Added". An imported file can be removed from the Library (it asks first if the timeline uses it); its clips then turn red and export stops until the file is imported again, which relinks them. Picking the same file twice in a row now imports it (the file input is cleared after each pick). Checked by `scripts/library-check.mjs`.
+- **Play** on an export result starts that video.
+- Messages float in the top-right corner instead of pushing the page down. (A message used to shift the timeline under the pointer, so the next click could land on a different clip.)
+
+Checked by `scripts/editing-check.mjs` (14 checks, mouse and keyboard in Chrome, including a server export with Main hidden and every track muted: black under the overlays, silent).
+
+## Resize, move and rotate on the preview (own core)
+
+Like CapCut: a click on the preview selects what is under the pointer (the top item first, then the main-track clip) and draws a box around it. Drag inside the box to move it (it snaps to the centre lines), a corner to resize it (keeping its shape), and the round handle below it to rotate it (snaps to 0° and 90°; hold Shift for 15° steps). A click on empty frame clears the selection. The Inspector has the same as sliders, and "Reset size, position and rotation" for main-track clips.
+
+This works for images, videos and titles on tracks, and for main-track clips (whose size and turn apply on top of Fit or Fill). All export engines draw the same: FFmpeg scales, rotates (`rotate` with transparent corners) and places the picture on black; a turned title is drawn by the browser and turned by FFmpeg, because `drawtext` cannot turn text. Checked by `scripts/transform-check.mjs`: preview against the server export 0.956, against Mediabunny 0.961, with a resized and turned logo, a smaller turned video and a larger turned title.
+
+## Text and captions (own core)
+
+- **Titles:** "+ Text" adds a title at the playhead. Font (four), size, colour, an optional background box (colour and opacity), and position by dragging on the preview or with Top / Middle / Bottom.
+- **Captions:** "+ Caption" adds a line at the playhead on a Captions track, after any caption already showing, white on a dark box near the bottom. The Captions panel lists every line with its time: type to change a line, click its time to jump there. "Apply this style to all captions" copies font, size, colours, box and position from the selected caption. An .srt or .vtt file can be imported; it replaces the captions after asking, and keeps their style.
+- Captions are one line each; a line break in an .srt becomes a space.
+- The background box is drawn the same way by the preview, Mediabunny, and FFmpeg (`drawtext` box, or the browser-drawn picture for Hindi). Checked by `scripts/captions-check.mjs`: caption area of the exports against the preview 0.907 to 0.978, English and Hindi.
+- The side panels stop at the height of the player and scroll inside, so a long Inspector or captions list no longer pushes the timeline down.
+
 ## Player and frame ratio
 
 Under the preview, like CapCut: the time as HH:MM:SS:FF, Play, a ratio menu and full screen. The ratio menu offers Original (the shape of the first clip on Main), 16:9, 9:16, 1:1, 4:3, 3:4, 4:5, 2.35:1, 2:1 and 1.85:1; any `W:H` ratio works in the edit JSON and in all export engines (the short side is 720 or 1080 pixels).
@@ -122,6 +149,7 @@ node scripts/twick-add-check.mjs [<file>]           # Twick's Add to timeline fo
 node scripts/timeline-dnd-check.mjs                 # own core: drags between tracks and from the Library, then export
 node scripts/twick-dnd-check.mjs                    # Twick: the same track rules
 node scripts/player-check.mjs                       # player bar, ratio menu, Fit vs Fill, preview against exports
+node scripts/editing-check.mjs                      # Library click and +, multi-select, box select, lock/hide/mute, playhead handle
 ```
 
 ## Where things are

@@ -10,5 +10,6 @@ export function mainDuration(p: Project): number;
 export function audioLen(a: AudioItem): number;
 export function projectDuration(p: Project): number;
 export function layers(p: Project): Overlay[];
+export function applyTrackStates(p: Project): Project;
 export function normalizeProject(p: unknown): Project;
 export function overlapsOnTrack(items: { id: string; track: string; start: number; end: number }[], track: string, start: number, end: number, ignoreId?: string): boolean;
