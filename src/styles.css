@@ -33,10 +33,16 @@ h4 { margin: 10px 0 6px; font-size: 12px; text-transform: uppercase; letter-spac
 .bar .saved { margin-left: auto; color: var(--muted); font-size: 12px; }
 .file { border: 1px solid var(--line); border-radius: 8px; padding: 5px 10px; cursor: pointer; background: var(--surface); }
 .file input { display: none; }
-.notice { margin-top: 8px; padding: 8px 10px; border-radius: 8px; background: var(--orange); }
+.notice { margin-top: 8px; padding: 8px 10px; border-radius: 8px; background: var(--orange); display: flex; gap: 10px; align-items: center; justify-content: space-between; }
+button.link { border: 0; background: none; padding: 0 4px; color: var(--accent); text-decoration: underline; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.file.busy { opacity: 0.6; cursor: progress; }
 
 .stage { display: grid; grid-template-columns: 220px 1fr 240px; gap: 12px; margin-top: 10px; }
 .panel { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 4px 12px 12px; }
+.lib-list { max-height: 300px; overflow-y: auto; margin: 0 -4px; padding: 0 4px; }
+.lib-group { margin: 8px 0 4px; font-size: 11px; font-weight: 600; color: var(--muted); }
+.hint.warn { color: #b54708; }
 .lib { display: block; width: 100%; text-align: left; margin-bottom: 5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tag { font-size: 10px; padding: 1px 6px; border-radius: 999px; }
 .tag.video { background: var(--sky); } .tag.audio { background: var(--green); } .tag.image { background: var(--pink); }
@@ -45,6 +51,7 @@ h4 { margin: 10px 0 6px; font-size: 12px; text-transform: uppercase; letter-spac
 .form { display: flex; flex-direction: column; gap: 8px; }
 .form label { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--muted); }
 .form label.row { flex-direction: row; align-items: center; gap: 6px; color: var(--text); }
+.form textarea { font: inherit; resize: vertical; border: 1px solid var(--line); border-radius: 6px; padding: 4px 6px; }
 .form input:not([type="range"]):not([type="checkbox"]):not([type="color"]) { border: 1px solid var(--line); border-radius: 6px; padding: 4px 6px; }
 
 .tl-head { display: flex; gap: 14px; align-items: center; margin-top: 12px; }
@@ -60,8 +67,10 @@ h4 { margin: 10px 0 6px; font-size: 12px; text-transform: uppercase; letter-spac
 .clip.video { background: var(--sky); border-color: #b9cdf5; }
 .clip.text { background: var(--pink); border-color: #f3bccd; }
 .clip.image { background: var(--orange); border-color: #f3c9a2; }
-.clip.audio { background: var(--green); border-color: #b5dfc4; cursor: default; }
+.clip.audio { background: var(--green); border-color: #b5dfc4; }
 .clip.sel { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.clip .thumb { height: 22px; max-width: 40px; object-fit: contain; margin-left: 4px; pointer-events: none; border-radius: 3px; background: rgba(0, 0, 0, 0.08); }
+.track-empty { position: absolute; left: 8px; top: 12px; font-size: 12px; color: var(--muted); }
 .clip .h { width: 7px; align-self: stretch; background: rgba(40, 62, 115, 0.35); cursor: ew-resize; flex-shrink: 0; }
 .playhead { position: absolute; top: 0; bottom: 0; width: 2px; background: #e5484d; pointer-events: none; }
 
@@ -72,8 +81,16 @@ h4 { margin: 10px 0 6px; font-size: 12px; text-transform: uppercase; letter-spac
 .results table { width: 100%; border-collapse: collapse; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; }
 .results th, .results td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); font-size: 12px; }
 .results tr.err td { color: #b42318; white-space: pre-wrap; }
+.results td.actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.top .compare { margin-left: auto; font-size: 12px; }
 .result-video { width: 100%; max-height: 300px; background: #000; border-radius: 8px; }
 
 .twick-wrap { flex: 1; min-height: 0; overflow-y: auto; }
 .twick-log { padding: 6px 14px; background: var(--sky); color: var(--text); font-size: 12px; }
 .twick-host { height: 100vh; position: relative; }
+
+/* app header on the dark easy screen */
+.app.dark { background: #0d0e12; }
+.app.dark .top { background: #0d0e12; border-bottom-color: #2b2f3a; color: #f2f3f6; }
+.app.dark .top a { color: #9097a8; }
+.app.dark .top a.on { background: #f2f3f6; color: #0d0e12; }

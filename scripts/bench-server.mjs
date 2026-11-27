@@ -8,7 +8,7 @@ for (const h of [720, 1080]) {
 }
 // codec matrix: can the server read each container/codec as a clip?
 for (const [name, dur] of [["clipA_h264_16x9.mp4", 8], ["clipC_vp9.webm", 5], ["clipD_hevc.mov", 5]]) {
-  const p = { ...project, overlays: [], music: null, clips: [{ id: "x", name, src: "/media/" + name, in: 0, out: 2, srcDuration: dur, muted: false, hasAudio: true }] };
+  const p = { ...project, overlays: [], audio: [], clips: [{ id: "x", name, src: "/media/" + name, in: 0, out: 2, srcDuration: dur, muted: false, hasAudio: true }] };
   try { const r = await render(p, 720, `codec_${name}.mp4`); console.log(`codec OK   ${name}  ${r.ms} ms`); }
   catch (e) { console.log(`codec FAIL ${name}  ${String(e.message).split("\n").pop()}`); }
 }

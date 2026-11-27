@@ -59,10 +59,17 @@
       "end": 10
     }
   ],
-  "music": {
-    "src": "/media/music.mp3",
-    "name": "music.mp3",
-    "volume": 0.35,
-    "channels": 1
-  }
+  "audio": [
+    {
+      "id": "a1",
+      "name": "music.mp3",
+      "src": "/media/music.mp3",
+      "start": 0,
+      "in": 0,
+      "out": 10,
+      "srcDuration": 20,
+      "volume": 0.35,
+      "channels": 1
+    }
+  ]
 }

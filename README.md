@@ -38,9 +38,22 @@ npm run server         # render server on http://localhost:5181
 npm run dev            # app on http://localhost:5180
 ```
 
-Open `http://localhost:5180/#own` for the own-core editor and `http://localhost:5180/#twick` for Twick.
+Open `http://localhost:5180` for the **Easy editor** (the default, for non-technical users), `#own` for the **Advanced editor** (same draft, full controls and all three export engines) and `#twick` for Twick.
+
+For a walkthrough of every requirement row (the CEO demo), see [DEMO.md](DEMO.md).
 
 To reproduce Twick's WebM failure: in Twick press **New Project**, add the WebM clip with **Add to timeline**, then **Export**.
+
+## UI checks (headless Chrome)
+
+With the server and the app running:
+
+```
+npm run ui-check            # both editors (about 5 minutes)
+npm run ui-check advanced   # or easy
+```
+
+Drives a throwaway Chrome profile through each editor (upload, edit, undo, reload, all exports, save to library). Screenshots go to `out/ui-check/`; files the checks upload are deleted afterwards.
 
 ## Checks without a browser
 
@@ -48,6 +61,7 @@ To reproduce Twick's WebM failure: in Twick press **New Project**, add the WebM 
 node scripts/bench-server.mjs                       # server export timings, and which formats it reads
 node scripts/aspect-check.mjs                       # all three aspect ratios at 720p and 1080p
 node scripts/audio-check.mjs out/bench_720.mp4 0.2-3.8 4.2-6.8 7.2-9.8   # which sounds are in an export
+node scripts/timeline-check.mjs                     # photo clips and placed music pieces render correctly
 ```
 
 ## Where things are
@@ -55,11 +69,14 @@ node scripts/audio-check.mjs out/bench_720.mp4 0.2-3.8 4.2-6.8 7.2-9.8   # which
 | Path | What |
 | --- | --- |
 | `src/own/project.ts` | The edit JSON: types, split, reorder |
-| `src/own/editor.tsx` | Timeline, preview, inspector, undo/redo, autosave |
+| `src/own/easy/` | Easy editor: filmstrip timeline, context toolbar, option sheets, export sheet |
+| `src/own/editor.tsx` | Advanced editor: timeline, inspector, all three export engines |
+| `src/own/core/` | Shared by both editors: draft + undo (`history.ts`), live preview (`player.ts`), uploads and library (`media.ts`), thumbnails |
 | `src/own/compose.ts` | Draws a frame (crop-to-fit, text, logo); shared by preview and browser export |
 | `src/own/exporters.ts` | The three export engines |
 | `shared/ffmpeg-graph.js` | Edit JSON to FFmpeg arguments; shared by the server and ffmpeg.wasm |
-| `server/render-server.mjs` | PoC render server (a queue worker in production) |
+| `shared/fonts.js` | The title fonts; shared by the preview, both browser exporters and the server |
+| `server/render-server.mjs` | PoC render server (a queue worker in production), plus the library stand-in: uploads in `out/uploads`, saved exports in `out/library` |
 | `src/twick-demo.tsx` | The Twick demo |
 | `evidence/` | Frame comparison of the three engines |
 
@@ -67,11 +84,11 @@ node scripts/audio-check.mjs out/bench_720.mp4 0.2-3.8 4.2-6.8 7.2-9.8   # which
 
 - Tested only in Chrome on one Windows laptop, with generated test clips (not real phone footage).
 - Not tested: Safari, Firefox, mobile, videos longer than 16 seconds, concurrent exports, cloud storage, Hindi or other non-Latin text.
-- The own-core editor has no font picker yet.
+- Uploads and the library are folders on the local render server, with no login. Production needs cloud storage and the platform's own media library.
 - The initial timeline in the Twick demo is hand-written data and its second clip does not show; build a project with Twick's own buttons for a fair test.
 
 ## Third-party notes
 
 - **Twick** is installed from npm under its Sustainable Use Licence; none of its code is copied into this repository.
-- **Plus Jakarta Sans** (`public/fonts`) is under the SIL Open Font Licence.
+- **Plus Jakarta Sans, Bebas Neue, Anton, Playfair Display and Pacifico** (`public/fonts`, from the Google Fonts repository) are under the SIL Open Font Licence.
 - **ffmpeg-static** downloads a GPL build of FFmpeg at install time. Which build to ship in production is an open decision.
