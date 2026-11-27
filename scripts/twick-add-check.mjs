@@ -2,7 +2,7 @@
 // a clip uploaded with "Upload video", then reads the project Twick hands to "Save Draft".
 // Needs :5180 and :5181. usage: node scripts/twick-add-check.mjs [<file to upload>] [<name of the uploaded card>]
 import puppeteer from "puppeteer-core";
-const upload = process.argv[2] ?? "C:/Users/LENOVO/Downloads/file_example_MP4_1920_18MG.mp4";
+const upload = process.argv[2] ?? "public/media/clipD_hevc.mov"; // any video file; this one comes with npm run media
 const uploadMatch = process.argv[3]; // name to look for if the server renames the file (an AVI comes back as *_converted.mp4)
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 const browser = await puppeteer.launch({ executablePath: "C:/Program Files/Google/Chrome/Application/chrome.exe", headless: "new", defaultViewport: { width: 1440, height: 1000 } });
@@ -58,7 +58,8 @@ console.log("  timeline:", JSON.stringify(await timeline()));
 const [chooser] = await Promise.all([page.waitForFileChooser({ timeout: 5000 }), page.evaluate(() => [...document.querySelectorAll("button, label")].find((x) => /upload video/i.test(x.textContent))?.click())]);
 await chooser.accept([upload]);
 await wait(5000);
-const upName = uploadMatch ?? upload.split(/[\\/]/).pop().replace(/[^a-zA-Z0-9._-]/g, "_");
+// the server saves an upload as "<time>_<name>", which also keeps it apart from a library clip of the same name
+const upName = uploadMatch ?? "_" + upload.split(/[\\/]/).pop().replace(/[^a-zA-Z0-9._-]/g, "_");
 console.log(`uploaded ${upName}:`, await addCard(upName));
 await wait(1500);
 console.log("  timeline:", JSON.stringify(await timeline()));

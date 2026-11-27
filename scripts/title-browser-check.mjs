@@ -21,7 +21,7 @@ await wait(1200);
 await page.evaluate(() => {
   const q = window.__poc.getProject();
   window.__poc.setProject({
-    ...q, aspect: "16:9", music: null, clips: [{ ...q.clips[0], in: 1, out: 3 }],
+    ...q, aspect: "16:9", audios: [], tracks: [], clips: [{ ...q.clips[0], in: 1, out: 3 }],
     overlays: [
       { id: "hi", kind: "text", text: "दिवाली की हार्दिक शुभकामनाएँ", font: "jakarta", fontSize: 56, color: "#FFE08A", x: 0.5, y: 0.3, start: 0, end: 2 },
       { id: "pp", kind: "text", text: "त्योहार की बिक्री: 40% छूट", font: "poppins", fontSize: 48, color: "#FFFFFF", x: 0.5, y: 0.52, start: 0, end: 2 },

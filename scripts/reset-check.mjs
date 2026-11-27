@@ -6,7 +6,7 @@ const errors = []; p.on("pageerror", (e) => errors.push(String(e))); p.on("conso
 await p.goto("http://localhost:5180/#own", { waitUntil: "networkidle0" });
 await new Promise((r) => setTimeout(r, 1200));
 const click = async (label) => { const h = await p.evaluateHandle((l) => [...document.querySelectorAll(".bar button")].find((x) => x.textContent.trim() === l), label); await h.click(); await new Promise((r) => setTimeout(r, 250)); };
-const state = () => p.evaluate(() => { const q = window.__poc.getProject(); return { clips: q.clips.length, overlays: q.overlays.length, time: document.querySelector(".bar .time").textContent }; });
+const state = () => p.evaluate(() => { const q = window.__poc.getProject(); return { clips: q.clips.length, overlays: q.overlays.length, time: document.querySelector(".player-bar .time").textContent }; });
 const out = {};
 await p.evaluate(() => window.__poc.seek(2)); await click("Split at playhead"); await click("+ Text"); out.edited = await state();
 await click("Reset"); out.afterReset = await state();

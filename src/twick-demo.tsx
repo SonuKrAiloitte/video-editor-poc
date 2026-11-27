@@ -2,10 +2,11 @@
  * Candidate A: Twick Studio (the stack recommended in the one-page requirements).
  * Mounted as shipped, seeded with our test media, with its own browser renderer wired to Export.
  */
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { LivePlayerProvider, TimelineProvider, TwickStudio } from "@twick/studio";
 import "@twick/studio/dist/studio.css";
 import { renderTwickVideoInBrowser } from "@twick/browser-render";
+import { TwickTrackRules } from "./twick-track-rules";
 
 const M = (name: string) => `${location.origin}/media/${name}`;
 
@@ -19,7 +20,7 @@ const INITIAL = {
   version: 1,
   tracks: [
     {
-      id: "t-video", name: "Video", type: "video",
+      id: "t-video", name: "Main", type: "video",
       elements: [
         { id: "e-a", trackId: "t-video", name: "Clip A", type: "video", s: 0, e: 4, mediaDuration: 8, objectFit: "cover", frame: { size: [720, 1280] }, props: { src: M("clipA_h264_16x9.mp4"), time: 1, volume: 1, play: true } },
         { id: "e-c", trackId: "t-video", name: "Clip 2", type: "video", s: 4, e: 7, mediaDuration: SECOND.mediaDuration, objectFit: "cover", frame: { size: [720, 1280] }, props: { src: SECOND.src, time: SECOND.time, volume: 0, play: true } },
@@ -38,13 +39,30 @@ const INITIAL = {
 
 export function TwickDemo() {
   const [log, setLog] = useState<string>("Use Export in the Twick header to run Twick's own browser renderer.");
+  const host = useRef<HTMLDivElement>(null);
+
+  // Twick puts every clip added with "+" on a new track at the bottom of the timeline, often below the visible
+  // part, so it looked as if nothing happened. When a track appears, scroll the timeline to show it.
+  useEffect(() => {
+    const el = host.current;
+    if (!el) return;
+    let count = el.querySelectorAll(".twick-track").length;
+    const watch = new MutationObserver(() => {
+      const tracks = el.querySelectorAll(".twick-track");
+      if (tracks.length > count) tracks[tracks.length - 1]?.scrollIntoView({ block: "nearest" });
+      count = tracks.length;
+    });
+    watch.observe(el, { childList: true, subtree: true });
+    return () => watch.disconnect();
+  }, []);
 
   return (
     <div className="twick-wrap">
       <div className="twick-log">{log}</div>
-      <div className="twick-host">
+      <div className="twick-host" ref={host}>
         <LivePlayerProvider>
           <TimelineProvider initialData={INITIAL as never} contextId="poc-twick">
+            <TwickTrackRules onMessage={setLog} />
             <TwickStudio
               studioConfig={{
                 videoProps: { width: 720, height: 1280 },

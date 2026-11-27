@@ -33,7 +33,7 @@ await page.goto("http://localhost:5180/#own", { waitUntil: "networkidle0" });
 await wait(1200);
 if (flags.wasmseek) await page.evaluate((m) => (globalThis.__wasmSeek = m), flags.wasmseek);
 const input = await page.$('input[type="file"]');
-const state = () => page.evaluate(() => { const q = window.__poc.getProject(); return { n: q.clips.length, last: q.clips[q.clips.length - 1], music: q.music, notice: document.querySelector(".notice")?.textContent ?? null }; });
+const state = () => page.evaluate(() => { const q = window.__poc.getProject(); return { n: q.clips.length, last: q.clips[q.clips.length - 1], nAudio: q.audios.length, lastAudio: q.audios[q.audios.length - 1], notice: document.querySelector(".notice")?.textContent ?? null }; });
 
 console.log("1. import through the file picker");
 const videos = [], audios = [];
@@ -47,7 +47,7 @@ for (const file of paths) {
     await wait(250);
     now = await state();
     if (now.n > before.n) kind = "video";
-    else if (now.music?.src !== before.music?.src) kind = "audio";
+    else if (now.nAudio > before.nAudio) kind = "audio";
     else if (now.notice && now.notice !== before.notice && !/Converting it on the server/.test(now.notice)) kind = "notice"; // "Converting..." means: keep waiting
     else if (errors.length > nErr) kind = "error";
   }
@@ -58,8 +58,8 @@ for (const file of paths) {
     if (/converted it/.test(now.notice ?? "")) console.log("       -> " + now.notice);
     videos.push(c.id);
   } else if (kind === "audio") {
-    console.log(`OK   ${tag}\n       -> set as MUSIC (channels: ${now.music.channels ?? "?"})`);
-    audios.push({ name: want.file, music: now.music });
+    console.log(`OK   ${tag}\n       -> added on an AUDIO track (channels: ${now.lastAudio.channels ?? "?"}, ${now.lastAudio.out.toFixed(2)}s)`);
+    audios.push({ name: want.file, item: now.lastAudio });
   } else {
     console.log(`FAIL ${tag}\n       -> ${kind === "notice" ? "editor message: " + now.notice : kind === "error" ? "error: " + errors[errors.length - 1] : "nothing happened (no clip, no message)"}`);
   }
@@ -90,9 +90,9 @@ const preview = await page.evaluate(async (playMs) => {
     at += clip.out - clip.in;
   }
   window.__poc.seek(0); await w(600);
-  const time = () => document.querySelector(".bar .time").textContent;
-  const t1 = time(); document.querySelector(".bar button").click(); await w(playMs);
-  const m = window.__poc.media(); const t2 = time(); document.querySelector(".bar button").click();
+  const time = () => document.querySelector(".player-bar .time").textContent;
+  const t1 = time(); document.querySelector(".player-bar .play").click(); await w(playMs);
+  const m = window.__poc.media(); const t2 = time(); document.querySelector(".player-bar .play").click();
   return { rows, play: `${t1} -> ${t2} after ${playMs / 1000} s of play`, music: m.music };
 }, headed ? 9000 : 4000);
 preview.rows.forEach((r, i) => writeFileSync(`out/real_prev_${i}.png`, Buffer.from(r.png.split(",")[1], "base64")));
@@ -102,11 +102,11 @@ await beat();
 
 console.log("\n3. export with each engine, once per sound source");
 const want = await page.evaluate(() => window.__poc.getProject().clips.reduce((s, c) => s + c.out - c.in, 0));
-const variants = [{ label: "clips' own sound, no music", music: null, muted: false }, ...audios.map((a) => ({ label: "music = " + a.name, music: { ...a.music, volume: 0.5 }, muted: true }))];
+const variants = [{ label: "clips' own sound, no music", item: null, muted: false }, ...audios.map((a) => ({ label: "music = " + a.name, item: { ...a.item, volume: 0.5, start: 0, in: 0, out: Math.min(a.item.out, want) }, muted: true }))];
 let firstServer = null;
 for (const [vi, v] of variants.entries()) {
   console.log(`   ${v.label}`);
-  await page.evaluate((v) => { const q = window.__poc.getProject(); window.__poc.setProject({ ...q, music: v.music, clips: q.clips.map((c) => ({ ...c, muted: v.muted })) }); }, v);
+  await page.evaluate((v) => { const q = window.__poc.getProject(); window.__poc.setProject({ ...q, overlays: q.overlays.filter((o) => o.kind !== "image" || o.end <= q.clips.reduce((s, c) => s + c.out - c.in, 0)), audios: v.item ? [v.item] : [], clips: q.clips.map((c) => ({ ...c, muted: v.muted })) }); }, v);
   await wait(500);
   const outs = {}, db = {};
   for (const engine of engines) {
@@ -123,7 +123,7 @@ for (const [vi, v] of variants.entries()) {
     const log = spawnSync(ffmpegPath, ["-hide_banner", "-i", r.file, "-vf", "blackdetect=d=0.3:pix_th=0.08", "-af", "volumedetect", "-f", "null", "-"], { encoding: "utf8" }).stderr;
     const black = [...log.matchAll(/black_start:([\d.]+) black_end:([\d.]+)/g)].map((m) => `${(+m[1]).toFixed(1)}-${(+m[2]).toFixed(1)}s`);
     db[engine] = +(/mean_volume: (\S+)/.exec(log)?.[1] ?? NaN);
-    const soundOk = v.music ? db[engine] > -60 && (db.server === undefined || Math.abs(db[engine] - db.server) < 1) : true;
+    const soundOk = v.item ? db[engine] > -60 && (db.server === undefined || Math.abs(db[engine] - db.server) < 1) : true;
     const ok = p.duration !== null && Math.abs(p.duration - want) < 0.2 && black.length === 0 && soundOk;
     console.log(`${ok ? "OK  " : "WARN"} ${engine.padEnd(11)} ${(r.ms / 1000).toFixed(1).padStart(6)} s  ${p.size} ${p.duration}s (want ${want.toFixed(2)})  black:${black.length ? black.join(",") : "none"}  sound:${db[engine]} dB  ${(r.bytes / 1048576).toFixed(1)} MB`);
     outs[engine] = r.file;

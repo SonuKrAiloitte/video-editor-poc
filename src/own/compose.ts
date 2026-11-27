@@ -3,7 +3,8 @@
  * so what the user sees while editing is drawn by the same code that draws the export.
  */
 import { FONTS, fontFor } from "../../shared/fonts.js";
-import type { Project, TextOverlay } from "./project";
+import { layers } from "../../shared/model.js";
+import type { Project, TextOverlay, VideoOverlay } from "./project";
 
 /** CSS family name for a font from shared/fonts.js (the same .ttf FFmpeg reads on the server) */
 export const family = (id: string) => `poc-${id}`;
@@ -18,6 +19,8 @@ export function loadFont(id: string) {
 }
 
 const images = new Map<string, HTMLImageElement>();
+/** an image already loaded with loadImage, or undefined */
+export const getImage = (src: string) => images.get(src);
 export function loadImage(src: string): Promise<HTMLImageElement> {
   const hit = images.get(src);
   if (hit?.complete) return Promise.resolve(hit);
@@ -39,6 +42,19 @@ export function drawCover(ctx: Ctx, src: CanvasImageSource, sw: number, sh: numb
   const dw = sw * scale;
   const dh = sh * scale;
   ctx.drawImage(src, (W - dw) / 2, (H - dh) / 2, dw, dh);
+}
+
+/** Fit: scale the source until it fits inside the frame, centre it; the rest stays as it is (black). */
+export function drawContain(ctx: Ctx, src: CanvasImageSource, sw: number, sh: number, W: number, H: number) {
+  if (!sw || !sh) return;
+  const scale = Math.min(W / sw, H / sh);
+  const dw = sw * scale;
+  const dh = sh * scale;
+  ctx.drawImage(src, (W - dw) / 2, (H - dh) / 2, dw, dh);
+}
+/** A main-track picture in its clip's mode: fit (default) or fill. */
+export function drawMain(ctx: Ctx, fit: "fit" | "fill" | undefined, src: CanvasImageSource, sw: number, sh: number, W: number, H: number) {
+  (fit === "fill" ? drawCover : drawContain)(ctx, src, sw, sh, W, H);
 }
 
 /** One title, centred on (cx, cy). Preview, browser export and the PNG handed to FFmpeg all use this. */
@@ -70,17 +86,31 @@ export async function rasteriseTitle(o: TextOverlay, W: number, H: number): Prom
   return { blob: await canvas.convertToBlob({ type: "image/png" }), width };
 }
 
-export function drawOverlays(ctx: Ctx, p: Project, t: number, W: number, H: number) {
-  for (const o of p.overlays) {
+/** A picture of known size, centred on (x, y) as fractions of the frame, `width` as a fraction of the frame width. */
+function drawPlaced(ctx: Ctx, src: CanvasImageSource, sw: number, sh: number, o: { x: number; y: number; width: number }, W: number, H: number) {
+  if (!sw || !sh) return;
+  const w = o.width * W;
+  const h = (w * sh) / sw;
+  ctx.drawImage(src, o.x * W - w / 2, o.y * H - h / 2, w, h);
+}
+
+export type VideoFrameFor = (o: VideoOverlay) => { src: CanvasImageSource; w: number; h: number } | null;
+
+/** Everything on the visual tracks at time t, lowest track first. `frameOf` supplies the current frame of each video. */
+export function drawOverlays(ctx: Ctx, p: Project, t: number, W: number, H: number, frameOf?: VideoFrameFor) {
+  for (const o of layers(p)) {
+    if (o.kind === "video") {
+      if (t < o.start || t >= o.end) continue;
+      const fr = frameOf?.(o);
+      if (fr) drawPlaced(ctx, fr.src, fr.w, fr.h, o, W, H);
+      continue;
+    }
     if (t < o.start || t > o.end) continue;
     if (o.kind === "text") {
       drawTitle(ctx, o, o.x * W, o.y * H, W, H);
     } else {
       const img = images.get(o.src);
-      if (!img) continue;
-      const w = o.width * W;
-      const h = (w * img.naturalHeight) / img.naturalWidth;
-      ctx.drawImage(img, o.x * W - w / 2, o.y * H - h / 2, w, h);
+      if (img) drawPlaced(ctx, img, img.naturalWidth, img.naturalHeight, o, W, H);
     }
   }
 }
@@ -88,4 +118,5 @@ export function drawOverlays(ctx: Ctx, p: Project, t: number, W: number, H: numb
 export async function preloadOverlayAssets(p: Project) {
   await Promise.all(p.overlays.flatMap((o) => (o.kind === "text" ? [loadFont(fontFor(o.text, o.font).id)] : [])));
   await Promise.all(p.overlays.flatMap((o) => (o.kind === "image" ? [loadImage(o.src)] : [])));
+  await Promise.all(p.clips.flatMap((c) => (c.kind === "image" ? [loadImage(c.src)] : [])));
 }

@@ -52,6 +52,29 @@ What the real files turned up, and what was done:
 - **Uploads and concurrency.** Uploads are streamed to disk instead of held in memory, and the render server runs at most two FFmpeg jobs at once and queues the rest (5 exports asked for together all completed).
 - **Colour tag.** The server export now states its colour standard (BT.709). Without it a source with no colour tag gave an untagged export that players read differently.
 
+## Timeline: CapCut-style tracks
+
+Both demos follow the same track rules, like CapCut:
+
+| Track | Takes | Placement |
+| --- | --- | --- |
+| Main | video and images | Clips stay joined end to end. Remove or move one out and the rest close the gap. |
+| Tracks above Main | video, images and text | Anywhere in time, gaps allowed. Upper tracks are drawn over lower ones. |
+| Audio tracks | audio only | Anywhere in time. |
+
+A drop on the wrong kind of track is refused with a message. A clip dropped where it would cover another goes on a new track. Tracks left empty are removed.
+
+- **Own core:** drag from the Library onto any track or onto "New", drag clips sideways and between tracks, trim any clip by its edges. The edit JSON has `clips` (Main), `tracks`, `overlays` (items on tracks above) and `audios` (`shared/model.js`); older edits with one `music` field are converted on load. All three export engines handle videos on upper tracks (picture in picture), images on Main and several audio clips. Library drags use pointer events, not HTML5 drag, so they also work on touch screens.
+- **Twick:** Twick already lets you drop Library items on its timeline, but it only lets an element move onto a track of type "element", and never lets a video, image or audio element out onto a new track. `scripts/patch-twick.mjs` (run by `npm install`) adds a hook at those three places; `src/twick-track-rules.tsx` supplies the rules, joins up the Main track after each change and removes empty tracks. If a Twick update changes that code, the patch script stops with an error instead of patching blindly. Twick still refuses some moves on its own: it will not let a clip overlap another on the same track, and it ignores a drop that would run past the end of the timeline.
+
+Checked with mouse drags in Chrome: `scripts/timeline-dnd-check.mjs` (own core, 9 drags plus server and browser export) and `scripts/twick-dnd-check.mjs` (Twick, 8 checks). Twick's Library cards use the browser's built-in drag, which the test tool cannot perform with the mouse, so those drops are sent as the same drag events Chrome would send.
+
+## Player and frame ratio
+
+Under the preview, like CapCut: the time as HH:MM:SS:FF, Play, a ratio menu and full screen. The ratio menu offers Original (the shape of the first clip on Main), 16:9, 9:16, 1:1, 4:3, 3:4, 4:5, 2.35:1, 2:1 and 1.85:1; any `W:H` ratio works in the edit JSON and in all export engines (the short side is 720 or 1080 pixels).
+
+A clip whose shape differs from the frame is shown whole with black bars (Fit, CapCut's default). The Inspector can switch a main-track clip to Fill, which crops it to cover the frame. Checked by `scripts/player-check.mjs`: at 9:16, 16:9 and 2.35:1 the preview, the server export and the browser export show the same frame (match 0.955 to 0.965).
+
 ## Run it
 
 Needs Node 20 or newer. FFmpeg is downloaded by `npm install` (the `ffmpeg-static` package); nothing else to install.
@@ -96,6 +119,9 @@ node scripts/preview-check.mjs                      # no black frames while paus
 node scripts/reset-check.mjs                        # split, add text, Reset, Undo
 node scripts/twick-upload-check.mjs <file> ...      # your files through Twick's Upload video button
 node scripts/twick-add-check.mjs [<file>]           # Twick's Add to timeline for a seeded, a URL and an uploaded clip
+node scripts/timeline-dnd-check.mjs                 # own core: drags between tracks and from the Library, then export
+node scripts/twick-dnd-check.mjs                    # Twick: the same track rules
+node scripts/player-check.mjs                       # player bar, ratio menu, Fit vs Fill, preview against exports
 ```
 
 ## Where things are
@@ -103,6 +129,8 @@ node scripts/twick-add-check.mjs [<file>]           # Twick's Add to timeline fo
 | Path | What |
 | --- | --- |
 | `src/own/project.ts` | The edit JSON: types, split, reorder |
+| `shared/model.js` | Track rules (what goes where), edit length, drawing order, converting older edits |
+| `src/twick-track-rules.tsx`, `scripts/patch-twick.mjs` | The same track rules added to Twick |
 | `src/own/editor.tsx` | Timeline, preview, inspector, undo/redo, autosave, import |
 | `src/own/compose.ts` | Draws a frame (crop-to-fit, text, logo); shared by preview and browser export |
 | `src/own/exporters.ts` | The three export engines |

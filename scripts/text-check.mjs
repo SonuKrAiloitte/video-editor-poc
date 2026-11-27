@@ -11,7 +11,7 @@ const clip = { ...sample.clips[0], in: 1, out: 2 };
 const shots = [];
 for (const f of FONTS) {
   const project = {
-    ...sample, aspect: "16:9", clips: [clip], music: null,
+    ...sample, aspect: "16:9", clips: [clip], audios: [], tracks: [],
     overlays: [
       { id: "a", kind: "text", text: `${f.label}: Diwali Sale 40% off`, font: f.id, fontSize: 40, color: "#FFFFFF", x: 0.5, y: 0.3, start: 0, end: 1 },
       { id: "b", kind: "text", text: "दिवाली की हार्दिक शुभकामनाएँ", font: f.id, fontSize: 52, color: "#FFE08A", x: 0.5, y: 0.6, start: 0, end: 1 },
