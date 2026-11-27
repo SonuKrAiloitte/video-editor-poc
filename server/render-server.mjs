@@ -146,12 +146,15 @@ app.post("/api/twick-upload", async (req, res) => {
     const safe = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
     const saved = `out/uploads/${Date.now()}_${safe}`;
     writeFileSync(saved, Buffer.from(await file.arrayBuffer()));
+    // Twick needs a full URL: with a path like "/out/uploads/x.mp4" the clip shows in the library and plays,
+    // but "Add to timeline" silently does nothing. The browser's Origin header is the app's own address.
+    const base = req.headers.origin ?? `http://${req.headers.host}`;
     const isVideo = (file.type || "").startsWith("video") || BROWSER_UNFRIENDLY.test(safe);
     if (isVideo && (BROWSER_UNFRIENDLY.test(safe) || describe(saved).hdr)) {
       const done = await convert("/" + saved);
-      return res.json({ url: done.src, convertedFrom: done.from });
+      return res.json({ url: base + done.src, convertedFrom: done.from });
     }
-    res.json({ url: "/" + saved });
+    res.json({ url: base + "/" + saved });
   } catch (e) {
     res.status(500).json({ error: String(e.message ?? e) });
   }

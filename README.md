@@ -95,6 +95,7 @@ node scripts/font-ui-check.mjs                      # the font picker, with real
 node scripts/preview-check.mjs                      # no black frames while pausing and scrubbing
 node scripts/reset-check.mjs                        # split, add text, Reset, Undo
 node scripts/twick-upload-check.mjs <file> ...      # your files through Twick's Upload video button
+node scripts/twick-add-check.mjs [<file>]           # Twick's Add to timeline for a seeded, a URL and an uploaded clip
 ```
 
 ## Where things are
