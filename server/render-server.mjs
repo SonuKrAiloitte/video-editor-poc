@@ -4,7 +4,8 @@ import express from "express";
 import cors from "cors";
 import ffmpegPath from "ffmpeg-static";
 import { spawn, spawnSync } from "node:child_process";
-import { createWriteStream, mkdirSync, statSync } from "node:fs";
+import { createWriteStream, mkdirSync, statSync, writeFileSync } from "node:fs";
+import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -130,6 +131,31 @@ app.post("/api/convert", express.json({ limit: "64kb" }), async (req, res) => {
 });
 
 app.get("/api/queue", (_req, res) => res.json(queueState()));
+
+// Upload endpoint for Twick Studio's own "Upload" buttons (its "gcs" mode: multipart form with a
+// "file" field, answer { url }). Without an endpoint like this Twick only offers "paste a URL".
+// Files the browser cannot play (AVI and similar, or HDR) are converted first, like in our own editor.
+const BROWSER_UNFRIENDLY = /\.(avi|wmv|flv|mpg|mpeg|ts|mkv|3gp)$/i;
+app.post("/api/twick-upload", async (req, res) => {
+  try {
+    const form = await new Request("http://local/", {
+      method: "POST", headers: { "content-type": req.headers["content-type"] }, body: Readable.toWeb(req), duplex: "half",
+    }).formData();
+    const file = form.get("file");
+    if (!file || typeof file === "string") return res.status(400).json({ error: "no file in the upload" });
+    const safe = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
+    const saved = `out/uploads/${Date.now()}_${safe}`;
+    writeFileSync(saved, Buffer.from(await file.arrayBuffer()));
+    const isVideo = (file.type || "").startsWith("video") || BROWSER_UNFRIENDLY.test(safe);
+    if (isVideo && (BROWSER_UNFRIENDLY.test(safe) || describe(saved).hdr)) {
+      const done = await convert("/" + saved);
+      return res.json({ url: done.src, convertedFrom: done.from });
+    }
+    res.json({ url: "/" + saved });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message ?? e) });
+  }
+});
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   app.listen(5181, () => console.log(`render server on http://localhost:5181 (up to ${MAX_JOBS} exports at once)`));

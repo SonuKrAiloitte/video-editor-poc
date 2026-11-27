@@ -48,6 +48,9 @@ export function TwickDemo() {
             <TwickStudio
               studioConfig={{
                 videoProps: { width: 720, height: 1280 },
+                // Turns on Twick's own "Upload" buttons (video, audio, image panels), which open the
+                // computer's file picker. Our render server stores the file and answers with its URL.
+                uploadConfig: { uploadApiUrl: "/api/twick-upload", provider: "gcs" },
                 media: {
                   namespace: "poc",
                   seed: {

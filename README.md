@@ -68,6 +68,8 @@ Open `http://localhost:5180/#own` for the own-core editor and `http://localhost:
 
 To reproduce Twick's WebM failure: in Twick press **New Project**, add the WebM clip with **Add to timeline**, then **Export**.
 
+To add your own file to Twick: open **My assets** and press **Upload video**, which opens the file picker. Twick shows this button only when it is given an upload endpoint (`uploadConfig`); here the render server's `/api/twick-upload` stores the file and returns its URL, converting AVI and similar files to MP4 first. Without such an endpoint Twick only accepts a pasted URL, and it checks only the URL's extension, so a URL to a file that does not exist is still added.
+
 ## Checks
 
 Without a browser:
@@ -92,6 +94,7 @@ node scripts/title-browser-check.mjs                # Hindi and English titles i
 node scripts/font-ui-check.mjs                      # the font picker, with real clicks and typing
 node scripts/preview-check.mjs                      # no black frames while pausing and scrubbing
 node scripts/reset-check.mjs                        # split, add text, Reset, Undo
+node scripts/twick-upload-check.mjs <file> ...      # your files through Twick's Upload video button
 ```
 
 ## Where things are
@@ -116,7 +119,7 @@ node scripts/reset-check.mjs                        # split, add text, Reset, Un
 - A title in Hindi needs the browser to draw it. A render started on the server alone, with no browser involved, would need another way to draw such text (libass, or a newer FFmpeg).
 - ffmpeg.wasm does not shape Hindi either and uses the same PNG route. It is kept for comparison only.
 - The job queue lives in the render server's memory and uploads go to local disk. Production needs a real queue and object storage.
-- Twick was not run on the real files.
+- Twick: MP4, WebM, MOV and AVI uploads were checked to reach its library and play; exporting them from Twick was not tested.
 - The initial timeline in the Twick demo is hand-written data and its second clip does not show; build a project with Twick's own buttons for a fair test.
 
 ## Third-party notes
