@@ -241,7 +241,7 @@ export async function exportServer(p: Project, height: 720 | 1080, onProgress: P
   const project: Project = {
     ...p,
     clips: await Promise.all(p.clips.map(async (c) => ({ ...c, src: await remote(c.src) }))),
-    overlays: await Promise.all(p.overlays.map(async (o) => (o.kind === "text" ? o : { ...o, src: await remote(o.src) }))),
+    overlays: await Promise.all(p.overlays.map(async (o) => (o.kind === "image" || o.kind === "video" ? { ...o, src: await remote(o.src) } : o))),
     audios: await Promise.all(p.audios.map(async (a) => ({ ...a, src: await remote(a.src) }))),
   };
   onProgress(0.2);

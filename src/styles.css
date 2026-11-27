@@ -58,6 +58,8 @@ h4 { margin: 10px 0 6px; font-size: 12px; text-transform: uppercase; letter-spac
 .own .lib .lib-add { flex: none; width: 24px; height: 24px; padding: 0; border-radius: 6px; font-weight: 700; line-height: 1; background: var(--sky); border-color: #b9cdf5; }
 .tag { font-size: 10px; padding: 1px 6px; border-radius: 999px; }
 .tag.video { background: var(--sky); } .tag.audio { background: var(--green); } .tag.image { background: var(--pink); }
+.tag.fx, .tag.effect { background: #ece3ff; color: #4b2fb3; }
+.lib.fx { cursor: pointer; }
 /* player: preview on a dark ground with a control bar under it, like CapCut */
 .player { display: flex; flex-direction: column; background: #10131c; border-radius: 12px; overflow: hidden; min-width: 0; }
 .preview { position: relative; display: flex; align-items: center; justify-content: center; height: 340px; padding: 10px; }
@@ -127,6 +129,13 @@ h4 { margin: 10px 0 6px; font-size: 12px; text-transform: uppercase; letter-spac
 .clip.video { background: var(--sky); border-color: #b9cdf5; }
 .clip.text { background: var(--pink); border-color: #f3bccd; }
 .clip.image { background: var(--orange); border-color: #f3c9a2; }
+.clip.effect { background: #ece3ff; border-color: #cdb8f5; }
+/* the part of a clip that plays during the transition into it (both clips at once) */
+.tl .clip .overlap { position: absolute; left: 0; top: 0; bottom: 0; width: calc(var(--f) * var(--z) * 1px); background: repeating-linear-gradient(135deg, rgba(60, 40, 140, 0.18) 0 4px, transparent 4px 8px); pointer-events: none; }
+/* the button on each join between two main-track clips: + adds a transition, ⇄ has one */
+.tl .join { position: absolute; left: calc(var(--s) * var(--z) * 1px); top: 50%; transform: translate(-50%, -50%); width: 20px; height: 20px; padding: 0; border-radius: 50%; border: 1px solid #cdb8f5; background: #fff; color: #6d4ce8; font-size: 12px; line-height: 18px; font-weight: 700; z-index: 4; cursor: pointer; box-shadow: 0 1px 2px rgba(20, 30, 60, 0.15); }
+.tl .join.on { background: #6d4ce8; color: #fff; border-color: #6d4ce8; }
+.tl .join.picked { outline: 2px solid #e5484d; outline-offset: 1px; }
 .clip.audio { background: var(--green); border-color: #b5dfc4; }
 .track.main { background: #f6f8fd; }
 .track.audio { background: #f7fbf8; }

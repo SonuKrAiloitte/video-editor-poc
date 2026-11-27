@@ -8,6 +8,7 @@
     "build": "vite build",
     "server": "node server/render-server.mjs",
     "media": "node scripts/make-test-media.mjs",
+    "fx-assets": "node scripts/make-fx-assets.mjs",
     "typecheck": "tsc --noEmit",
     "twick-assets": "node node_modules/@twick/browser-render/scripts/copy-public-assets.js",
     "postinstall": "node scripts/patch-twick.mjs"

@@ -36,7 +36,7 @@ app.put("/api/upload/:name", async (req, res) => {
 const resolve = (src) => {
   const clean = decodeURIComponent(src.split("?")[0]);
   if (clean.startsWith("/out/uploads/")) return clean.slice(1);
-  if (clean.startsWith("/media/")) return "public" + clean;
+  if (clean.startsWith("/media/") || clean.startsWith("/fx/")) return "public" + clean;
   throw new Error("unknown media source: " + src);
 };
 

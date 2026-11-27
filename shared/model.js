@@ -10,7 +10,8 @@
 /** What a track of each kind accepts. "main" is the magnetic main track. */
 export const ACCEPTS = {
   main: ["video", "image"],
-  visual: ["video", "image", "text"],
+  // an effect on a visual track changes everything drawn below it while it runs, like CapCut's effect track
+  visual: ["video", "image", "text", "effect"],
   audio: ["audio"],
 };
 
@@ -22,6 +23,7 @@ export function refuseReason(itemKind, trackKind) {
   if (trackKind === "audio") return "An audio track takes audio only.";
   if (itemKind === "audio") return "Audio goes on an audio track.";
   if (trackKind === "main" && itemKind === "text") return "Text goes on a track above the main track.";
+  if (trackKind === "main" && itemKind === "effect") return "Effects go on a track above the main track.";
   return "This track does not take that kind of item.";
 }
 
@@ -45,7 +47,35 @@ export function frameSizeFor(aspect, short) {
   return r >= 1 ? [even(short * r), short] : [short, even(short / r)];
 }
 
-export const mainDuration = (p) => p.clips.reduce((s, c) => s + (c.out - c.in), 0);
+const lenOf = (c) => c.out - c.in;
+/**
+ * Length of the transition INTO clip i (from clip i - 1), in seconds, whole frames at 30 fps. During it both clips
+ * play at once, as in CapCut, so the main track gets that much shorter. It is at most half of either clip, so the
+ * transitions at the two ends of one clip never overlap.
+ */
+export function transitionDur(p, i) {
+  const c = p.clips[i];
+  const prev = p.clips[i - 1];
+  if (!i || !c?.transition?.type || !prev) return 0;
+  const d = Math.min(c.transition.duration, lenOf(prev) / 2, lenOf(c) / 2);
+  return Math.max(0, Math.floor(d * 30 + 1e-6) / 30);
+}
+/** Where each main-track clip starts: right after the one before, minus the transition between them. */
+export function mainStarts(p) {
+  const starts = [];
+  let t = 0;
+  p.clips.forEach((c, i) => {
+    t -= transitionDur(p, i);
+    starts.push(t);
+    t += lenOf(c);
+  });
+  return starts;
+}
+export function mainDuration(p) {
+  if (!p.clips.length) return 0;
+  const st = mainStarts(p);
+  return st[st.length - 1] + lenOf(p.clips[p.clips.length - 1]);
+}
 export const audioLen = (a) => a.out - a.in;
 
 /** Length of the whole edit: the main track, or further if something on another track ends later. */

@@ -1,5 +1,7 @@
 import type { AudioItem, Overlay, Project, TrackKind } from "../src/own/project";
-export type ItemKind = "video" | "image" | "text" | "audio";
+export type ItemKind = "video" | "image" | "text" | "audio" | "effect";
+export function transitionDur(p: Project, i: number): number;
+export function mainStarts(p: Project): number[];
 export const ACCEPTS: Record<"main" | TrackKind, ItemKind[]>;
 export function canPlace(itemKind: ItemKind, trackKind: "main" | TrackKind): boolean;
 export function refuseReason(itemKind: ItemKind, trackKind: "main" | TrackKind): string | null;

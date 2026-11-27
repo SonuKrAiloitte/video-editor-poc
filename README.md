@@ -6,7 +6,7 @@ It contains two working demos fed the same test clips:
 
 | Demo | What it is |
 | --- | --- |
-| **Own core** (`#own`) | Our own timeline, canvas preview and inspector over a small JSON edit file. The same edit exports three ways: FFmpeg on a server, Mediabunny in the browser, ffmpeg.wasm in the browser. |
+| **Own core** (`#own`) | Our own timeline, canvas preview and inspector over a small JSON edit file. The same edit exports three ways: FFmpeg on a server, Mediabunny in the browser, ffmpeg.wasm in the browser. Since transitions and effects were added, the editor exports with FFmpeg only (see below). |
 | **Twick** (`#twick`) | Twick Studio 0.15.31 mounted as shipped, with its own browser renderer wired to Export. |
 
 ## Result
@@ -102,6 +102,48 @@ Under the preview, like CapCut: the time as HH:MM:SS:FF, Play, a ratio menu and 
 
 A clip whose shape differs from the frame is shown whole with black bars (Fit, CapCut's default). The Inspector can switch a main-track clip to Fill, which crops it to cover the frame. Checked by `scripts/player-check.mjs`: at 9:16, 16:9 and 2.35:1 the preview, the server export and the browser export show the same frame (match 0.955 to 0.965).
 
+## Transitions and effects (own core)
+
+**Export is now FFmpeg only.** Every transition and effect is defined once for FFmpeg, and the preview copies FFmpeg's own maths, so they are built once rather than twice. The Mediabunny button is gone. Called directly, the Mediabunny engine refuses an edit that has transitions or effects and says to use the server. Mediabunny is still used when a file is imported, to check whether the browser can play it. ffmpeg.wasm takes the same FFmpeg command and also renders them (`scripts/fx-wasm-check.mjs`).
+
+**Transitions (14)**
+- Fade, fade through black, fade through white.
+- Slide left, right, up and down; wipe left and right.
+- Circle open, zoom in, pixelize: FFmpeg's `xfade`.
+- Ink and Brush: mask videos, where black shows the outgoing clip and white the incoming one.
+
+How they work:
+- Click the **+** between two clips on the main track, then pick a transition in the Library's **Transitions** tab.
+- The Inspector changes the type and length (0.1 to 2 s) and removes it; Delete also removes it.
+- As in CapCut, both clips play at once during a transition, so the edit gets that much shorter. A transition uses at most half of either clip.
+- The sound crossfades too (`acrossfade`).
+- On the timeline the overlapping part is striped, and the join shows ⇄.
+
+**Effects (10)**
+- Blur, pixelate, black & white, flash, shake, zoom pulse, RGB split, film grain, vignette, light leak.
+- Pick one in the **Effects** tab: it goes at the playhead for 3 s, on an **Effects** track at the top.
+- Like CapCut's effect track, it changes everything on the tracks below it while it runs.
+- It moves and trims like any block. The Inspector sets the effect and its strength.
+
+**Adding more is content, not code.** The list is `shared/fx.js`, read by both the preview and the FFmpeg builder.
+- A new mask transition is a black-to-white video.
+- A new overlay effect is a video laid over the picture in "screen" mode, like the light leak.
+- `scripts/make-fx-assets.mjs` (`npm run fx-assets`) generates the three files shipped here (`public/fx`). In production a designer makes them and the asset library holds them.
+
+**Preview against export.** Checked by `scripts/fx-browser-check.mjs`. Scores are frame comparisons against the FFmpeg export (1.0 = identical):
+- Every transition at 30, 50 and 80 % of the way: 0.857 to 0.997.
+- Every effect in the middle of its strip: 0.863 to 0.982. Film grain is compared at a small size, because its random pattern differs by design.
+- Every export is the length the edit says, and the 440 Hz / 660 Hz test tones crossfade.
+
+Three things had to match FFmpeg exactly:
+- **`xfade` and `vignette` run in RGB.** In YUV, FFmpeg's "black" is darker than black and clipped the incoming clip away.
+- **Zoom-in and pixelize take exactly the source pixels FFmpeg takes.**
+- **Pixelize uses 32-bit float maths, as FFmpeg does.** At some frames `ceil(d * 50)` differs by one between float and double.
+
+`scripts/fx-render-check.mjs` renders every transition and effect on the server alone, without a browser.
+
+FFmpeg's own "zoom in" fills the frame with the single centre pixel halfway through. That is how FFmpeg does it, and the preview shows the same.
+
 ## Speed on a slower laptop (own core)
 
 Measured in Chrome with its CPU slowed 4x and 6x, on an edit like a real one: a 4-minute 1080p 60 fps recording cut into four clips, a picture-in-picture video, a title, a caption and music. "Worst" is the longest gap between two screen updates during the action; under 50 ms feels smooth, over 100 ms feels stuck. Production build (`npm run build`, then `npx vite preview`).
@@ -167,6 +209,8 @@ node scripts/fonts-unit-check.mjs                   # which titles FFmpeg may dr
 node scripts/probe.mjs <file> ...                   # codec, size, frame rate, rotation of any file
 node scripts/real-media-check.mjs <file> ...        # your own video files through the server export
 node scripts/make-phone-media.mjs                   # phone-style clips: rotation flag, HEVC MOV, HDR, variable frame rate
+node scripts/fx-render-check.mjs [<id>]             # every transition and effect rendered by FFmpeg, length checked
+node scripts/make-fx-assets.mjs                     # regenerate the mask videos and the light leak in public/fx
 ```
 
 In Chrome (needs both servers running and Chrome installed at the default Windows path):
@@ -184,6 +228,8 @@ node scripts/timeline-dnd-check.mjs                 # own core: drags between tr
 node scripts/twick-dnd-check.mjs                    # Twick: the same track rules
 node scripts/player-check.mjs                       # player bar, ratio menu, Fit vs Fill, preview against exports
 node scripts/editing-check.mjs                      # Library click and +, multi-select, box select, lock/hide/mute, playhead handle
+node scripts/fx-browser-check.mjs [<id>]            # transitions and effects: the UI, then preview against the FFmpeg export, and the sound
+node scripts/fx-wasm-check.mjs                      # ffmpeg.wasm with a transition and an effect strip
 ```
 
 ## Where things are

@@ -8,7 +8,7 @@
  *   visual track video, image and text, anywhere in time
  *   audio track  audio only
  */
-import { frameSizeFor, mainDuration, projectDuration, resolveAspect } from "../../shared/model.js";
+import { frameSizeFor, mainDuration, mainStarts, projectDuration, resolveAspect, transitionDur } from "../../shared/model.js";
 
 /** "W:H" such as "9:16" or "2.35:1", or "original" (the first main clip's shape) */
 export type Aspect = string;
@@ -40,6 +40,8 @@ export interface Clip {
   rotation?: number;
   /** set while exporting when the main track is hidden */
   hidden?: boolean;
+  /** transition INTO this clip from the one before it: an id from shared/fx.js and its length in seconds */
+  transition?: { type: string; duration: number };
 }
 
 /** The buttons on a track header. Locked: nothing on it can be moved, trimmed or deleted. */
@@ -53,7 +55,7 @@ export interface Track extends TrackState {
   id: string;
   kind: TrackKind;
   /** "captions": the visual track that holds the caption lines */
-  role?: "captions";
+  role?: "captions" | "effects";
 }
 
 interface OverlayBase {
@@ -103,7 +105,17 @@ export interface VideoOverlay extends OverlayBase {
   hasAudio: boolean;
   channels?: number;
 }
-export type Overlay = TextOverlay | ImageOverlay | VideoOverlay;
+/** An effect strip: while it runs it changes everything drawn below its track (x, y are unused). */
+export interface EffectOverlay extends OverlayBase {
+  kind: "effect";
+  /** an id from shared/fx.js EFFECTS */
+  effect: string;
+  /** strength 0..1 */
+  amount: number;
+}
+export type Overlay = TextOverlay | ImageOverlay | VideoOverlay | EffectOverlay;
+/** overlays that show a file (image or video) */
+export const hasFile = (o: Overlay): o is ImageOverlay | VideoOverlay => o.kind === "image" || o.kind === "video";
 
 /** An audio clip on an audio track. It plays source time `in`..`out` starting at timeline time `start`. */
 export interface AudioItem {
@@ -139,15 +151,25 @@ export const mainLength = (p: Project): number => mainDuration(p);
 /** source time `in`..`out` that a video overlay plays */
 export const overlayOut = (o: VideoOverlay) => o.in + (o.end - o.start);
 
-/** Where each clip starts on the main track (clips are packed end to end, so reorder = array move). */
-export function clipStarts(p: Project): number[] {
-  const starts: number[] = [];
-  let t = 0;
-  for (const c of p.clips) {
-    starts.push(t);
-    t += clipLen(c);
+/** Where each clip starts on the main track (packed end to end, overlapping by their transitions). */
+export const clipStarts = (p: Project): number[] => mainStarts(p);
+
+/** The transition playing at time t on the main track, if any: progress p goes 1 -> 0, as in FFmpeg's xfade. */
+export function transitionAt(p: Project, t: number): { from: Clip; fromStart: number; to: Clip; toStart: number; type: string; duration: number; progress: number } | null {
+  const starts = mainStarts(p);
+  for (let i = 1; i < p.clips.length; i++) {
+    const d = transitionDur(p, i);
+    const s = starts[i]!;
+    if (d > 0 && t >= s && t < s + d) {
+      // whole frames, as in the export (30 fps), and in 32-bit floats like FFmpeg's xfade:
+      // progress = 1 - frame / frames in the transition
+      const frame = Math.floor((t - s) * 30 + 1e-6);
+      const frames = Math.round(d * 30);
+      const progress = Math.fround(1 - Math.fround(Math.fround(frame) / Math.fround(frames)));
+      return { from: p.clips[i - 1]!, fromStart: starts[i - 1]!, to: p.clips[i]!, toStart: s, type: p.clips[i]!.transition!.type, duration: d, progress: Math.min(1, Math.max(0, progress)) };
+    }
   }
-  return starts;
+  return null;
 }
 
 export function clipAt(p: Project, t: number): { clip: Clip; index: number; start: number } | null {
@@ -168,7 +190,8 @@ export function splitAt(p: Project, t: number): Project {
   const cut = hit.clip.in + (t - hit.start);
   if (cut - hit.clip.in < 0.1 || hit.clip.out - cut < 0.1) return p;
   const a: Clip = { ...hit.clip, out: cut };
-  const b: Clip = { ...hit.clip, id: uid(), in: cut };
+  const { transition: _keep, ...rest } = hit.clip; // the transition stays at the start of the first half
+  const b: Clip = { ...rest, id: uid(), in: cut };
   const clips = [...p.clips];
   clips.splice(hit.index, 1, a, b);
   return { ...p, clips };

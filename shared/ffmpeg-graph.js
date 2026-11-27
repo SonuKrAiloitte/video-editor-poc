@@ -3,7 +3,8 @@
 // One builder, two runtimes: this is what keeps server and browser exports identical.
 
 import { fontFor } from "./fonts.js";
-import { applyTrackStates, audioLen, frameSizeFor, layers, mainDuration, normalizeProject, projectDuration, resolveAspect } from "./model.js";
+import { effectDef, fx, transitionDef } from "./fx.js";
+import { applyTrackStates, audioLen, frameSizeFor, layers, mainDuration, normalizeProject, projectDuration, resolveAspect, transitionDur } from "./model.js";
 
 export { projectDuration };
 
@@ -54,17 +55,19 @@ export function buildFfmpegArgs(input, opts) {
     return idx++;
   };
 
-  // 1. main track: trim -> crop-to-fit -> concat (images are stills of the clip's length)
-  const pairs = [];
-  for (const c of project.clips) {
-    const len = n(c.out - c.in);
+  // 1. main track. A clip becomes pieces: its middle, and its ends that take part in a transition. A transition is
+  // made from the end of one clip and the start of the next (FFmpeg's xfade, or a mask video), and all pieces are
+  // joined with concat. Each piece is its own input with its own seek, so no stream has to wait in memory.
+  /** a piece of a clip: `len` seconds starting `from` seconds into the clip; returns its [video, audio] labels */
+  const clipPiece = (c, from, rawLen) => {
+    const len = n(rawLen);
     const still = c.kind === "image";
     // opts.seek = "filter" keeps the old behaviour for videos (decode from the start, cut in the filter graph).
     const inputSeek = opts.seek !== "filter" || still;
     let vi;
-    if (inputSeek) vi = addInput(c.src, still ? 0 : c.in, len, still);
+    if (inputSeek) vi = addInput(c.src, still ? 0 : c.in + from, len, still);
     else (args.push("-i", opts.resolve(c.src)), (vi = idx++));
-    const cut = inputSeek ? `end=${len}` : `start=${n(c.in)}:end=${n(c.out)}`;
+    const cut = inputSeek ? `end=${len}` : `start=${n(c.in + from)}:end=${n(c.in + from + len)}`;
     if (c.hidden) f.push(`color=c=black:s=${W}x${H}:r=30:d=${len},format=yuv420p,setsar=1[v${vi}]`); // hidden main track
     else if (!plain(c)) {
       // its own size, position and turn: fit (or fill) a box `scale` times the frame, turn it, place it on black
@@ -89,12 +92,47 @@ export function buildFfmpegArgs(input, opts) {
       const vol = c.muted ? 0 : project.originalVolume;
       f.push(`[${vi}:a]atrim=${cut},asetpts=PTS-STARTPTS,volume=${n(vol)},${toStereo(c.channels)}[a${vi}]`);
     }
-    pairs.push(`[v${vi}][a${vi}]`);
-  }
+    return [`v${vi}`, `a${vi}`];
+  };
+  let tn = 0;
+  /** the transition from the end of `prev` into the start of `c`, `d` seconds long; the sound crossfades */
+  const transitionPiece = (prev, c, d) => {
+    const [va, aa] = clipPiece(prev, prev.out - prev.in - d, d);
+    const [vb, ab] = clipPiece(c, 0, d);
+    const def = transitionDef(c.transition.type) ?? transitionDef("fade");
+    const k = tn++;
+    if (def.kind === "mask") {
+      // the mask's brightness becomes the incoming clip's opacity (black: outgoing clip, white: incoming clip)
+      args.push("-i", opts.resolve(def.mask));
+      const mi = idx++;
+      f.push(
+        `[${mi}:v]setpts=PTS*${n(d / def.maskLen)},fps=30,tpad=stop_mode=clone:stop_duration=1,trim=end=${n(d)},` +
+          `scale=${W}:${H}:in_range=tv:out_range=pc,format=gray[mk${k}]`,
+      );
+      f.push(`[${vb}]format=yuva420p[tb${k}]`);
+      f.push(`[tb${k}][mk${k}]alphamerge[tm${k}]`);
+      f.push(`[${va}][tm${k}]overlay=0:0:shortest=1,format=yuv420p,setsar=1[tv${k}]`);
+    } else {
+      // in RGB, like the preview: in YUV, xfade's "black" (Y = 0) is darker than black and clips the incoming clip away
+      f.push(`[${va}]format=gbrp[xa${k}]`);
+      f.push(`[${vb}]format=gbrp[xb${k}]`);
+      f.push(`[xa${k}][xb${k}]xfade=transition=${def.xfade}:duration=${n(d)}:offset=0,format=yuv420p,setsar=1[tv${k}]`);
+    }
+    f.push(`[${aa}][${ab}]acrossfade=d=${n(d)}:c1=tri:c2=tri[ta${k}]`);
+    return [`tv${k}`, `ta${k}`];
+  };
+  const pieces = [];
+  project.clips.forEach((c, i) => {
+    const dIn = transitionDur(project, i);
+    const dOut = transitionDur(project, i + 1);
+    if (dIn > 0) pieces.push(transitionPiece(project.clips[i - 1], c, dIn));
+    const middle = c.out - c.in - dIn - dOut;
+    if (middle > 0.5 / 30) pieces.push(clipPiece(c, dIn, middle));
+  });
   let last;
   let abase;
-  if (pairs.length) {
-    f.push(`${pairs.join("")}concat=n=${pairs.length}:v=1:a=1[vcat][acat]`);
+  if (pieces.length) {
+    f.push(`${pieces.map(([v, a]) => `[${v}][${a}]`).join("")}concat=n=${pieces.length}:v=1:a=1[vcat][acat]`);
     last = "vcat";
     abase = "acat";
     if (total > main + 1e-3) {
@@ -111,7 +149,56 @@ export function buildFfmpegArgs(input, opts) {
     abase = "abase";
   }
 
-  // 2. visual tracks, lowest first: text (drawtext), images and videos (overlay), each gated to its time range
+  /**
+   * An effect strip changes everything drawn so far (the main track and the tracks below it) while it runs.
+   * Filters that can switch on and off by time use `enable`; the others (crop, zoompan, the light leak) work on a
+   * copy that is laid over the picture only during the strip.
+   */
+  let en = 0;
+  const effect = (o, from, out, gate) => {
+    const a = o.amount ?? 0.5;
+    const s = Math.min(W, H) / 720;
+    const S = n(o.start);
+    const e = en++;
+    const onCopy = (filters) => {
+      f.push(`[${from}]split[ea${e}][eb${e}]`);
+      f.push(`[eb${e}]${filters},setsar=1[ec${e}]`);
+      f.push(`[ea${e}][ec${e}]overlay=0:0:${gate}[${out}]`);
+    };
+    switch (o.effect) {
+      case "blur": f.push(`[${from}]gblur=sigma=${n(fx.blurSigma(a, s))}:${gate}[${out}]`); break;
+      case "pixelate": { const b = fx.pixelBlock(a, s); f.push(`[${from}]pixelize=w=${b}:h=${b}:${gate}[${out}]`); break; }
+      case "bw": f.push(`[${from}]hue=s=0:${gate}[${out}]`); break;
+      case "flash": f.push(`[${from}]eq=brightness='${fx.flashExpr(a, S)}':eval=frame:${gate}[${out}]`); break;
+      case "glitch": { const g = fx.glitchShift(a, s); f.push(`[${from}]rgbashift=rh=${g}:bh=${-g}:${gate}[${out}]`); break; }
+      case "grain": f.push(`[${from}]noise=c0s=${fx.grain(a)}:c0f=t+u:${gate}[${out}]`); break;
+      // in RGB (picture times the factor), like the preview; in YUV it also darkens by the 16..235 offset
+      case "vignette": f.push(`[${from}]format=gbrp,vignette=angle=${n(fx.vignetteAngle(a))}:${gate},format=yuv420p[${out}]`); break;
+      case "shake": {
+        const z = fx.shakeZoom(a);
+        onCopy(`crop=${even(W / z)}:${even(H / z)}:x='(iw-ow)/2*(1+${fx.shakeXExpr(S)})':y='(ih-oh)/2*(1+${fx.shakeYExpr(S)})',scale=${W}:${H}`);
+        break;
+      }
+      case "zoompulse":
+        onCopy(`zoompan=z='${fx.pulseExpr(a, S).replace(/\bt\b/g, "in_time")}':d=1:x='iw/2-iw/zoom/2':y='ih/2-ih/zoom/2':s=${W}x${H}:fps=30`);
+        break;
+      case "leak": {
+        // the light-leak video, looped for the strip, black before and after it ("screen" with black changes nothing)
+        const def = effectDef("leak");
+        const len = n(o.end - o.start);
+        args.push("-stream_loop", "-1", "-t", String(len), "-i", opts.resolve(def.asset));
+        const li = idx++;
+        f.push(`[${li}:v]scale=${W}:${H},fps=30,trim=end=${len},setpts=PTS-STARTPTS,format=gbrp,tpad=start_duration=${S}:stop_mode=add:stop_duration=${n(total - o.end + 1)}:color=black[lk${e}]`);
+        f.push(`[${from}]format=gbrp[lb${e}]`);
+        f.push(`[lb${e}][lk${e}]blend=all_mode=screen:all_opacity=${n(fx.leakOpacity(a))}:shortest=1,format=yuv420p[${out}]`);
+        break;
+      }
+      default: f.push(`[${from}]null[${out}]`);
+    }
+    return out;
+  };
+
+  // 2. visual tracks, lowest first: text (drawtext), images and videos (overlay), effects, each gated to its time range
   const mix = [];
   let k = 0;
   for (const o of layers(project)) {
@@ -126,6 +213,9 @@ export function buildFfmpegArgs(input, opts) {
           (o.bg ? `box=1:boxcolor=${o.bg.replace("#", "0x")}@${n(o.bgOpacity ?? 0.6)}:boxborderw=${Math.round(size * 0.3)}:` : "") +
           `x=${n(o.x)}*w-text_w/2:y=${n(o.y)}*h-text_h/2:${gate}[${out}]`,
       );
+    } else if (o.kind === "effect") {
+      last = effect(o, last, out, gate);
+      continue;
     } else if (o.kind === "image") {
       const ii = idx++;
       args.push("-i", opts.resolve(o.src));

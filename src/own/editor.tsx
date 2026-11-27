@@ -11,13 +11,15 @@
 import { memo, startTransition, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { ALL_FORMATS, BlobSource, Input } from "mediabunny";
 import { DEFAULT_FONT, FONTS, fontFor } from "../../shared/fonts.js";
-import { RATIOS, applyTrackStates, audioLen, canPlace, layers, normalizeProject, overlapsOnTrack, refuseReason, resolveAspect, type ItemKind } from "../../shared/model.js";
+import { DEFAULT_TRANSITION_SECONDS, EFFECTS, MAX_TRANSITION_SECONDS, TRANSITIONS, effectDef, transitionDef } from "../../shared/fx.js";
+import { RATIOS, applyTrackStates, audioLen, canPlace, layers, normalizeProject, overlapsOnTrack, refuseReason, resolveAspect, transitionDur, type ItemKind } from "../../shared/model.js";
 import sample from "../../shared/sample-project.json";
-import { drawMain, drawOverlays, getImage, loadImage, mainRect, measureTitle, preloadOverlayAssets } from "./compose";
+import { drawMain, drawOverlays, drawTransition, getImage, loadImage, mainRect, measureTitle, preloadOverlayAssets } from "./compose";
 import { blobNames, exportFfmpegWasm, exportMediabunny, exportServer, type ExportResult } from "./exporters";
 import {
   clipAt, clipLen, clipStarts, frameSize, insertIndexAt, mainLength, moveClip, splitAt, totalDuration, uid,
-  type AudioItem, type Clip, type ImageOverlay, type Overlay, type Project, type TrackKind, type TrackState,
+  hasFile, transitionAt,
+  type AudioItem, type Clip, type EffectOverlay, type ImageOverlay, type Overlay, type Project, type TrackKind, type TrackState,
 } from "./project";
 
 const STORAGE_KEY = "poc-own-editor-draft-v1";
@@ -76,7 +78,7 @@ const fileNameOf = (src: string) => decodeURIComponent(src.split("?")[0]!.split(
 const missingFiles = (p: Project, librarySrcs: Set<string>) => [
   ...new Set([
     ...p.clips.filter((c) => isMissing(c.src, librarySrcs)).map((c) => c.name),
-    ...p.overlays.flatMap((o) => (o.kind !== "text" && isMissing(o.src, librarySrcs) ? [o.kind === "video" ? o.name : fileNameOf(o.src)] : [])),
+    ...p.overlays.flatMap((o) => (hasFile(o) && isMissing(o.src, librarySrcs) ? [o.kind === "video" ? o.name : fileNameOf(o.src)] : [])),
     ...p.audios.filter((a) => isMissing(a.src, librarySrcs)).map((a) => a.name),
   ]),
 ];
@@ -343,13 +345,16 @@ type TimelineActions = {
   startBox: (e: React.PointerEvent) => void;
   scrub: (e: React.PointerEvent) => void;
   toggleTrack: (row: RowId, key: keyof TrackState) => void;
+  /** pick the join before clip `id` on the main track, to give it a transition */
+  pickJoin: (id: string) => void;
 };
 /** a block's place in time; CSS turns it into pixels with the zoom (--z on .tl), so zooming does not re-render blocks */
 const at = (start: number, len: number) => ({ "--s": start, "--d": len }) as React.CSSProperties;
 
-const ClipBlock = memo(function ClipBlock({ c, i, start, sel, lost, act }: { c: Clip; i: number; start: number; sel: boolean; lost: boolean; act: TimelineActions }) {
+const ClipBlock = memo(function ClipBlock({ c, i, start, sel, lost, fade, act }: { c: Clip; i: number; start: number; sel: boolean; lost: boolean; fade: number; act: TimelineActions }) {
   return (
-    <div data-ref={`clip:${c.id}`} className={`clip ${c.kind === "image" ? "image" : "video"} ${sel ? "sel" : ""} ${lost ? "lost" : ""}`} style={at(start, clipLen(c))} onPointerDown={(e) => act.grabClip(e, i)}>
+    <div data-ref={`clip:${c.id}`} className={`clip ${c.kind === "image" ? "image" : "video"} ${sel ? "sel" : ""} ${lost ? "lost" : ""}`} style={{ ...at(start, clipLen(c)), "--f": fade } as React.CSSProperties} onPointerDown={(e) => act.grabClip(e, i)}>
+      {fade > 0 && <b className="overlap" aria-hidden="true" />}
       <i className="h l" onPointerDown={(e) => act.trimClip(e, c, i, "in")} />
       <span>{c.muted ? "(muted) " : ""}{c.name}</span>
       <i className="h r" onPointerDown={(e) => act.trimClip(e, c, i, "out")} />
@@ -360,7 +365,7 @@ const OverlayBlock = memo(function OverlayBlock({ o, sel, lost, act }: { o: Over
   return (
     <div data-ref={`overlay:${o.id}`} className={`clip ${o.kind} ${sel ? "sel" : ""} ${lost ? "lost" : ""}`} style={at(o.start, o.end - o.start)} onPointerDown={(e) => act.grabOverlay(e, o)}>
       <i className="h l" onPointerDown={(e) => act.trimOverlay(e, o, "start")} />
-      <span>{o.kind === "text" ? o.text : o.kind === "video" ? o.name : (o as ImageOverlay).src.split("/").pop()}</span>
+      <span>{o.kind === "text" ? o.text : o.kind === "video" ? o.name : o.kind === "effect" ? `✦ ${effectDef(o.effect)?.label ?? o.effect}` : (o as ImageOverlay).src.split("/").pop()}</span>
       <i className="h r" onPointerDown={(e) => act.trimOverlay(e, o, "end")} />
     </div>
   );
@@ -407,9 +412,11 @@ function ZoomSlider({ store }: { store: Store<number> }) {
   return <label>Zoom <input type="range" min={20} max={200} value={v} onChange={(e) => (setV(Number(e.target.value)), push(Number(e.target.value)))} /></label>;
 }
 
-const Timeline = memo(function Timeline({ p, selected, hover, librarySrcs, zoomStore, time, act, trackRef }: {
+const Timeline = memo(function Timeline({ p, selected, join, hover, librarySrcs, zoomStore, time, act, trackRef }: {
   p: Project;
   selected: Ref[];
+  /** the join picked for a transition: id of the clip after it */
+  join: string | null;
   hover: { row: RowId; ok: boolean } | null;
   librarySrcs: Set<string>;
   zoomStore: Store<number>;
@@ -451,7 +458,7 @@ const Timeline = memo(function Timeline({ p, selected, hover, librarySrcs, zoomS
       <div className="tl-wrap">
         <div className="tl-labels">
           <div className="ruler" />
-          {visualTracks.map((tr, n) => <TrackHead key={tr.id} name={tr.role === "captions" ? "Captions" : `Track ${visualTracks.length - n + 1}`} kind="visual" state={tr} onToggle={(k) => act.toggleTrack(tr.id, k)} />)}
+          {visualTracks.map((tr, n) => <TrackHead key={tr.id} name={tr.role === "captions" ? "Captions" : tr.role === "effects" ? "Effects" : `Track ${visualTracks.length - n + 1}`} kind="visual" state={tr} onToggle={(k) => act.toggleTrack(tr.id, k)} />)}
           <TrackHead name="Main" kind="main" state={p.main ?? {}} onToggle={(k) => act.toggleTrack("main", k)} />
           {audioTracks.map((tr, n) => <TrackHead key={tr.id} name={`Audio ${n + 1}`} kind="audio" state={tr} onToggle={(k) => act.toggleTrack(tr.id, k)} />)}
           <div className="track new">New</div>
@@ -462,12 +469,22 @@ const Timeline = memo(function Timeline({ p, selected, hover, librarySrcs, zoomS
             {visualTracks.map((tr, n) => (
               <div key={tr.id} className={rowClass(tr.id, `visual ${rowState(tr.id)}`)} data-label={`Track ${visualTracks.length - n + 1}`} {...rowEvents(tr.id)}>
                 {p.overlays.filter((o) => o.track === tr.id).map((o) => (
-                  <OverlayBlock key={o.id} o={o} sel={isSel(o.id)} lost={o.kind !== "text" && missing(o.src)} act={act} />
+                  <OverlayBlock key={o.id} o={o} sel={isSel(o.id)} lost={hasFile(o) && missing(o.src)} act={act} />
                 ))}
               </div>
             ))}
             <div className={rowClass("main", `main ${rowState("main")}`)} data-label="Main" {...rowEvents("main")}>
-              {p.clips.map((c, i) => <ClipBlock key={c.id} c={c} i={i} start={starts[i] ?? 0} sel={isSel(c.id)} lost={missing(c.src)} act={act} />)}
+              {p.clips.map((c, i) => <ClipBlock key={c.id} c={c} i={i} start={starts[i] ?? 0} sel={isSel(c.id)} lost={missing(c.src)} fade={transitionDur(p, i)} act={act} />)}
+              {/* the joins between clips: click one, then pick a transition (CapCut's button between clips) */}
+              {p.clips.slice(1).map((c, k) => {
+                const d = transitionDur(p, k + 1);
+                const def = c.transition ? transitionDef(c.transition.type) : undefined;
+                return (
+                  <button key={`join:${c.id}`} data-join={c.id} className={`join ${d > 0 ? "on" : ""} ${join === c.id ? "picked" : ""}`} style={{ "--s": (starts[k + 1] ?? 0) + d / 2 } as React.CSSProperties}
+                    title={def ? `${def.label}, ${d.toFixed(1)} s. Click to change` : "Add a transition here"} aria-label={def ? `Transition: ${def.label}` : "Add a transition here"}
+                    onPointerDown={(e) => e.stopPropagation()} onClick={() => act.pickJoin(c.id)}>{d > 0 ? "⇄" : "+"}</button>
+                );
+              })}
               {mainLength(p) === 0 && <span className="empty">Drop video or images here</span>}
             </div>
             {audioTracks.map((tr, n) => (
@@ -528,7 +545,9 @@ export function OwnEditor() {
   /** everything selected on the timeline; the last one picked is the one the Inspector shows */
   const [selected, setSelected] = useState<Ref[]>([]);
   const sel = selected[selected.length - 1] ?? null;
-  const setSel = useCallback((r: Ref | null) => setSelected(r ? [r] : []), []);
+  /** the join picked for a transition (id of the clip after it); selecting an item clears it */
+  const [join, setJoin] = useState<string | null>(null);
+  const setSel = useCallback((r: Ref | null) => (setSelected(r ? [r] : []), setJoin(null)), []);
   const isSel = (id: string) => selected.some((x) => x.id === id);
   /** box selection: a rectangle dragged over empty timeline */
   const [box, setBox] = useState<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
@@ -577,7 +596,7 @@ export function OwnEditor() {
       /* ignore */
     }
   }, [library]);
-  const [libTab, setLibTab] = useState<"media" | "audio">("media");
+  const [libTab, setLibTab] = useState<"media" | "audio" | "transitions" | "effects">("media");
   /** the Library item being dragged, drawn next to the pointer */
   const [ghost, setGhost] = useState<{ name: string; kind: Media["kind"]; x: number; y: number } | null>(null);
 
@@ -599,6 +618,9 @@ export function OwnEditor() {
   const audioEls = useRef(new Map<string, HTMLAudioElement>());
   /** copy of the last main-track frame drawn, shown while the browser is busy seeking */
   const lastFrame = useRef<HTMLCanvasElement | null>(null);
+  /** the two clips' pictures during a transition */
+  const transA = useRef<HTMLCanvasElement | null>(null);
+  const transB = useRef<HTMLCanvasElement | null>(null);
   /** which picture lastFrame holds, so it is copied once per new picture and not on every frame */
   const keepKey = useRef("");
   const [W, H] = frameSize(p, 720);
@@ -665,23 +687,50 @@ export function OwnEditor() {
         clock.set(dur);
       }
       const time = tRef.current;
-      const hit = clipAt(proj, Math.min(time, Math.max(0, dur - 0.001)));
+      const at = Math.min(time, Math.max(0, dur - 0.001));
+      const hit = clipAt(proj, at);
+      // during a transition the clip before plays too; its sound fades out as the new clip's fades in
+      const tr = transitionAt(proj, at);
       const live = new Set<string>();
 
-      // main track: only the clip under the playhead plays
+      // main track: only the clip under the playhead plays (and the outgoing one during a transition)
       let active: HTMLVideoElement | null = null;
+      let outgoing: HTMLVideoElement | null = null;
       for (const c of proj.clips) {
         if (c.kind === "image") continue;
         const v = videoFor(c.id, c.src);
         live.add(c.id);
+        const vol = c.muted ? 0 : proj.originalVolume;
         if (hit && hit.clip.id === c.id) {
           active = v;
-          sync(v, c.in + (time - hit.start), c.muted ? 0 : proj.originalVolume);
+          sync(v, c.in + (time - hit.start), tr ? vol * (1 - tr.progress) : vol);
+        } else if (tr && tr.from.id === c.id) {
+          outgoing = v;
+          sync(v, c.in + (time - tr.fromStart), vol * tr.progress);
         } else if (!v.paused) v.pause();
       }
-      // videos on the visual tracks
+      // a mask transition's mask video, stretched to the transition's length
+      let mask: HTMLVideoElement | null = null;
+      const trDef = tr ? transitionDef(tr.type) : undefined;
+      if (tr && trDef?.kind === "mask" && trDef.mask) {
+        mask = videoFor("mask", trDef.mask);
+        live.add("mask");
+        sync(mask, ((time - tr.toStart) / tr.duration) * (trDef.maskLen ?? 1), 0);
+      }
+      // videos on the visual tracks, and the videos some effects lay over the picture (light leak, looped)
       const pip = new Map<string, HTMLVideoElement>();
       for (const o of proj.overlays) {
+        if (o.kind === "effect") {
+          const def = effectDef(o.effect);
+          if (!def?.asset) continue;
+          const v = videoFor(o.id, def.asset);
+          live.add(o.id);
+          if (time >= o.start && time <= o.end) {
+            sync(v, (time - o.start) % (def.assetLen ?? 1), 0);
+            pip.set(o.id, v);
+          } else if (!v.paused) v.pause();
+          continue;
+        }
         if (o.kind !== "video") continue;
         const v = videoFor(o.id, o.src);
         live.add(o.id);
@@ -709,22 +758,41 @@ export function OwnEditor() {
 
       const cv = canvasRef.current;
       const ctx = cv?.getContext("2d");
-      const showMain = !!hit && !hit.clip.hidden;
-      const still = showMain && hit?.clip.kind === "image" ? getImage(hit.clip.src) : undefined;
-      const ready = !!still || (showMain && !!active && active.readyState >= 2);
+      /** a main-track clip's picture now: "black" when hidden, null while its video is not ready */
+      const frameOf = (c: Clip, v: HTMLVideoElement | null): { src: CanvasImageSource; w: number; h: number } | "black" | null => {
+        if (c.hidden) return "black";
+        if (c.kind === "image") {
+          const img = getImage(c.src);
+          return img ? { src: img, w: img.naturalWidth, h: img.naturalHeight } : null;
+        }
+        return v && v.readyState >= 2 ? { src: v, w: v.videoWidth, h: v.videoHeight } : null;
+      };
+      const fb = hit ? frameOf(hit.clip, active) : null;
+      const fa = tr ? frameOf(tr.from, outgoing) : null;
+      const showMain = !!hit && (fb !== "black" || !!tr);
+      const ready = !!fb && (!tr || !!fa);
       // playing, and the next clip's video is still seeking: keep the picture already on screen for this frame
       // (no copy of every frame is needed for that while playing)
       const hold = playRef.current && showMain && !ready;
       if (cv && ctx && !hold) {
         const keep = (lastFrame.current ??= document.createElement("canvas"));
         const sameSize = keep.width === cv.width && keep.height === cv.height;
-        if (ready) {
-          ctx.fillStyle = "#000";
-          ctx.fillRect(0, 0, cv.width, cv.height);
-          if (still) drawMain(ctx, hit!.clip, still, still.naturalWidth, still.naturalHeight, cv.width, cv.height);
-          else if (active) drawMain(ctx, hit!.clip, active, active.videoWidth, active.videoHeight, cv.width, cv.height);
+        if (ready && showMain) {
+          const paint = (x: CanvasRenderingContext2D, c: Clip, fr: { src: CanvasImageSource; w: number; h: number } | "black") => {
+            x.fillStyle = "#000";
+            x.fillRect(0, 0, cv.width, cv.height);
+            if (fr !== "black") drawMain(x, c, fr.src, fr.w, fr.h, cv.width, cv.height);
+          };
+          if (tr && fa) {
+            const pa = (transA.current ??= document.createElement("canvas"));
+            const pb = (transB.current ??= document.createElement("canvas"));
+            for (const c of [pa, pb]) if (c.width !== cv.width || c.height !== cv.height) (c.width = cv.width), (c.height = cv.height);
+            paint(pa.getContext("2d")!, tr.from, fa);
+            paint(pb.getContext("2d")!, tr.to, fb!);
+            drawTransition(ctx, tr.type, tr.progress, pa, pb, cv.width, cv.height, mask && mask.readyState >= 2 ? mask : null);
+          } else paint(ctx, hit!.clip, fb!);
           // paused: keep a copy of this picture for while the next seek is on its way, once per new picture
-          const key = `${hit!.clip.id}|${still ? "image" : active?.currentTime}|${cv.width}x${cv.height}|${JSON.stringify(hit!.clip)}`;
+          const key = `${hit!.clip.id}|${fb !== "black" && fb?.src === active ? active?.currentTime : "still"}|${tr ? `${outgoing?.currentTime}|${mask?.currentTime}|${tr.progress}` : ""}|${cv.width}x${cv.height}|${JSON.stringify(hit!.clip)}`;
           if (!playRef.current && keepKey.current !== key) {
             if (!sameSize) (keep.width = cv.width), (keep.height = cv.height);
             keep.getContext("2d")?.drawImage(cv, 0, 0);
@@ -771,6 +839,7 @@ export function OwnEditor() {
     const o = proj.overlays.find((x) => x.id === ref.id);
     if (!o || time < o.start || time > o.end) return null;
     if (o.kind === "text") return { cx: o.x * fw, cy: o.y * fh, ...measureTitle(o, fw, fh), rot: o.rotation ?? 0 };
+    if (o.kind === "effect") return null; // an effect has no box of its own on the preview
     let ratio = 16 / 9;
     const img = o.kind === "image" ? getImage(o.src) : undefined;
     const v = o.kind === "video" ? videos.current.get(o.id) : undefined;
@@ -898,7 +967,10 @@ export function OwnEditor() {
   const LOCKED = "This track is locked. Unlock it with the lock button on its left to change what is on it.";
   /** Delete everything selected, except what sits on a locked track. */
   const removeSelected = () => {
-    if (!selected.length) return;
+    if (!selected.length) {
+      if (join) setTransition(join, undefined);
+      return;
+    }
     const cur = pRef.current;
     const gone = new Set(selected.filter((r) => !locked(rowOf(r))).map((r) => r.id));
     const kept = selected.length - gone.size;
@@ -1089,7 +1161,7 @@ export function OwnEditor() {
         const next = {
           ...cur,
           clips: cur.clips.map((c) => fix(c, c.name)),
-          overlays: cur.overlays.map((o) => (o.kind === "text" ? o : fix(o, o.kind === "video" ? o.name : fileNameOf(o.src)))),
+          overlays: cur.overlays.map((o) => (!hasFile(o) ? o : fix(o, o.kind === "video" ? o.name : fileNameOf(o.src)))),
           audios: cur.audios.map((a) => fix(a, a.name)),
         };
         if (relinked) h.commit(next);
@@ -1106,7 +1178,7 @@ export function OwnEditor() {
   };
   /** how many places on the timeline use this file */
   const usesOf = (src: string, proj = pRef.current) =>
-    proj.clips.filter((c) => c.src === src).length + proj.overlays.filter((o) => o.kind !== "text" && o.src === src).length + proj.audios.filter((a) => a.src === src).length;
+    proj.clips.filter((c) => c.src === src).length + proj.overlays.filter((o) => hasFile(o) && o.src === src).length + proj.audios.filter((a) => a.src === src).length;
   /** Take an imported file out of the Library. Clips that use it stay on the timeline, marked red. */
   const removeFromLibrary = (m: Media) => {
     const n = usesOf(m.src);
@@ -1115,6 +1187,69 @@ export function OwnEditor() {
     if (libPreview?.src === m.src) setLibPreview(null);
     setNotice(n ? `${m.name} was removed from the Library; ${n} clip${n > 1 ? "s are" : " is"} now red.` : `${m.name} was removed from the Library.`);
   };
+  // ------------------------------------------------------------------ transitions and effects
+  /** the join a transition goes on: the picked one, else the one before the selected main-track clip */
+  const joinTarget = (): string | null => {
+    const clips = pRef.current.clips;
+    if (join && clips.some((c, i) => i > 0 && c.id === join)) return join;
+    if (sel?.type === "clip") {
+      const i = clips.findIndex((c) => c.id === sel.id);
+      if (i > 0) return sel.id;
+      if (i === 0 && clips[1]) return clips[1].id;
+    }
+    return null;
+  };
+  /** set (or with undefined remove) the transition into clip `id` */
+  const setTransition = (id: string, t: { type: string; duration: number } | undefined) => {
+    if (pRef.current.main?.locked) return void setNotice(LOCKED);
+    const cur = pRef.current;
+    const next = {
+      ...cur,
+      clips: cur.clips.map((c) => {
+        if (c.id !== id) return c;
+        const { transition: _old, ...rest } = c;
+        return t ? { ...rest, transition: t } : rest;
+      }),
+    };
+    h.commit(next);
+    return next;
+  };
+  /** a transition picked in the Library: put it on the join, and move the playhead into it so the preview shows it */
+  const applyTransition = (type: string) => {
+    const id = joinTarget();
+    if (!id) return void setNotice("Click the + between two clips on the main track first, then pick a transition.");
+    const old = pRef.current.clips.find((c) => c.id === id)?.transition;
+    const next = setTransition(id, { type, duration: old?.duration ?? DEFAULT_TRANSITION_SECONDS });
+    setSelected([]);
+    setJoin(id);
+    if (!next) return;
+    const i = next.clips.findIndex((c) => c.id === id);
+    seek((clipStarts(next)[i] ?? 0) + transitionDur(next, i) / 2);
+  };
+  const pickJoin = (id: string) => {
+    setSelected([]);
+    setJoin(id);
+    setLibTab("transitions");
+  };
+  /**
+   * An effect from the Library, at the playhead for 3 s, on an Effects track at the top: it changes everything on the
+   * tracks below it while it runs (CapCut's effect track).
+   */
+  const addEffect = (effect: string) => {
+    let proj = pRef.current;
+    const start = Math.round(tRef.current * 10) / 10;
+    const len = totalDuration(proj);
+    const end = len - start >= 1 ? Math.min(start + 3, len) : start + 3;
+    let track = proj.tracks.find((x) => x.role === "effects" && !x.locked && !overlapsOnTrack(itemsOn(proj), x.id, start, end))?.id;
+    if (!track) {
+      track = uid();
+      proj = { ...proj, tracks: [{ id: track, kind: "visual", role: "effects" }, ...proj.tracks] };
+    }
+    const o: EffectOverlay = { id: uid(), track, kind: "effect", effect, amount: 0.5, x: 0.5, y: 0.5, start, end };
+    h.commit({ ...proj, overlays: [...proj.overlays, o] });
+    setSel({ type: "overlay", id: o.id });
+  };
+
   const addText = () => {
     const proj = pRef.current;
     const start = Math.round(tRef.current * 10) / 10;
@@ -1351,7 +1486,7 @@ export function OwnEditor() {
       const o = cur.overlays.find((x) => x.id === ref.id)!;
       const len = o.end - o.start;
       if (rk === "main") {
-        if (o.kind === "text") return;
+        if (o.kind === "text" || o.kind === "effect") return;
         const clip: Clip = o.kind === "video"
           ? { id: o.id, kind: "video", name: o.name, src: o.src, in: o.in, out: o.in + len, srcDuration: o.srcDuration, muted: o.muted, hasAudio: o.hasAudio, channels: o.channels }
           : { id: o.id, kind: "image", name: o.src.split("/").pop() ?? "image", src: o.src, in: 0, out: len, srcDuration: 3600, muted: false, hasAudio: false };
@@ -1535,6 +1670,11 @@ export function OwnEditor() {
       setNotice(missingMessage(lost));
       return err;
     }
+    if (key === "mediabunny" && (pRef.current.clips.some((c) => c.transition) || pRef.current.overlays.some((o) => o.kind === "effect"))) {
+      const err = { engine: key, error: "The browser export (Mediabunny) does not draw transitions and effects. Export with Server: FFmpeg." };
+      setResults((prev) => [...prev, err]);
+      return err;
+    }
     const length = totalDuration(pRef.current);
     if (key !== "server" && length > BROWSER_EXPORT_MAX_SECONDS && !force) {
       setNotice(`This edit is ${Math.round(length)} s long. Edits over ${BROWSER_EXPORT_MAX_SECONDS} s are exported on the server, which is several times faster for long videos.`);
@@ -1583,8 +1723,12 @@ export function OwnEditor() {
   const selClip = sel?.type === "clip" ? p.clips.find((c) => c.id === sel.id) : undefined;
   const selOverlay = sel?.type === "overlay" ? p.overlays.find((o) => o.id === sel.id) : undefined;
   const selAudio = sel?.type === "audio" ? p.audios.find((a) => a.id === sel.id) : undefined;
+  const joinIndex = !sel && join ? p.clips.findIndex((c, i) => i > 0 && c.id === join) : -1;
+  const joinClip = joinIndex > 0 ? p.clips[joinIndex] : undefined;
+  const joinLen = joinClip ? transitionDur(p, joinIndex) : 0;
+  const targetJoin = joinTarget();
   /** stable handlers for the memoised timeline */
-  const act = useActions<TimelineActions>({ grabClip, trimClip, grabOverlay, trimOverlay, grabAudio, trimAudio, startBox, scrub, toggleTrack });
+  const act = useActions<TimelineActions>({ grabClip, trimClip, grabOverlay, trimOverlay, grabAudio, trimAudio, startBox, scrub, toggleTrack, pickJoin });
   const pressBox = (e: React.PointerEvent, mode: "move" | "scale" | "turn") => sel && transformItem(e, sel, mode);
   /** typing in a text field: one Undo step per burst, the edit gets the text a moment after the keys stop */
   const typeText = (id: string) => ({ onStart: h.checkpoint, onLive: (text: string) => patchOverlay(id, { text }, true) });
@@ -1629,14 +1773,48 @@ export function OwnEditor() {
       <div className="stage">
         <aside className="panel">
           <h4>Library</h4>
-          {/* Media (video and images, which share tracks) and Audio, as two tabs like CapCut */}
-          <div className="lib-tabs" role="tablist">
-            {(["media", "audio"] as const).map((tab) => (
+          {/* Media (video and images, which share tracks), Audio, Transitions and Effects, as tabs like CapCut */}
+          <div className="lib-tabs four" role="tablist">
+            {(["media", "audio", "transitions", "effects"] as const).map((tab) => (
               <button key={tab} role="tab" aria-selected={libTab === tab} className={libTab === tab ? "on" : ""} onClick={() => setLibTab(tab)}>
-                {tab === "media" ? "Media" : "Audio"} <span className="count">{libItems.filter((m) => (m.kind === "audio") === (tab === "audio")).length}</span>
+                {tab[0]!.toUpperCase() + tab.slice(1)}{" "}
+                <span className="count">{tab === "transitions" ? TRANSITIONS.length : tab === "effects" ? EFFECTS.length : libItems.filter((m) => (m.kind === "audio") === (tab === "audio")).length}</span>
               </button>
             ))}
           </div>
+          {libTab === "transitions" && (
+            <>
+              <p className="hint">{targetJoin ? "Pick a transition for the join that is marked on the timeline." : "First click the + between two clips on the main track, then pick a transition."}</p>
+              <div className="lib-list">
+                {TRANSITIONS.map((t) => {
+                  const on = !!targetJoin && p.clips.find((c) => c.id === targetJoin)?.transition?.type === t.id;
+                  return (
+                    <div key={t.id} className={`lib fx ${on ? "playing" : ""}`} role="button" tabIndex={0} title={`${t.label}: put it on the picked join`}
+                      onClick={() => applyTransition(t.id)} onKeyDown={(e) => e.key === "Enter" && applyTransition(t.id)}>
+                      <span className="tag fx">{t.kind === "mask" ? "mask" : "move"}</span> <span className="lib-name">{t.label}</span>
+                      {on && <span className="added">On</span>}
+                    </div>
+                  );
+                })}
+              </div>
+            </>
+          )}
+          {libTab === "effects" && (
+            <>
+              <p className="hint">Adds the effect at the playhead for 3 s, on an Effects track. It changes everything on the tracks below it.</p>
+              <div className="lib-list">
+                {EFFECTS.map((e) => (
+                  <div key={e.id} className="lib fx" role="button" tabIndex={0} title={`${e.label}: add at the playhead`}
+                    onClick={() => addEffect(e.id)} onKeyDown={(ev) => ev.key === "Enter" && addEffect(e.id)}>
+                    <span className="tag effect">effect</span> <span className="lib-name">{e.label}</span>
+                    <button className="lib-add" aria-label={`Add ${e.label} at the playhead`} title="Add at the playhead" onClick={(ev) => (ev.stopPropagation(), addEffect(e.id))}>+</button>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+          {(libTab === "media" || libTab === "audio") && (
+            <>
           <label className="file lib-import">{libTab === "media" ? "+ Import video or image" : "+ Import audio"}
             <input
               type="file"
@@ -1669,6 +1847,8 @@ export function OwnEditor() {
             ))}
           </div>
           <p className="hint">Click to play. Drag onto the timeline, or press + to add at the playhead.</p>
+            </>
+          )}
         </aside>
 
         <div className="player" ref={playerRef}>
@@ -1789,6 +1969,41 @@ export function OwnEditor() {
               <p className="hint">Drag on the preview to position. Drag its edges on the timeline to trim.</p>
             </div>
           )}
+          {joinClip && (
+            <div className="form">
+              <b>Transition: {p.clips[joinIndex - 1]?.name} → {joinClip.name}</b>
+              <label>Transition
+                <select value={joinClip.transition?.type ?? ""} onChange={(e) => setTransition(joinClip.id, e.target.value ? { type: e.target.value, duration: joinClip.transition?.duration ?? DEFAULT_TRANSITION_SECONDS } : undefined)}>
+                  <option value="">None</option>
+                  {TRANSITIONS.map((t) => <option key={t.id} value={t.id}>{t.label}</option>)}
+                </select>
+              </label>
+              {joinClip.transition && (
+                <>
+                  <label>Length {joinLen.toFixed(1)} s
+                    <input type="range" min={0.1} max={MAX_TRANSITION_SECONDS} step={0.1} value={joinClip.transition.duration}
+                      onChange={(e) => setTransition(joinClip.id, { ...joinClip.transition!, duration: Number(e.target.value) })} />
+                  </label>
+                  {joinLen < joinClip.transition.duration - 0.05 && <p className="hint">Shortened to {joinLen.toFixed(1)} s: a transition can use at most half of each clip.</p>}
+                  <p className="hint">Both clips play at once during it, so the video is {joinLen.toFixed(1)} s shorter.</p>
+                  <button onClick={() => setTransition(joinClip.id, undefined)}>Remove transition</button>
+                </>
+              )}
+            </div>
+          )}
+          {selOverlay?.kind === "effect" && (
+            <div className="form">
+              <label>Effect
+                <select value={selOverlay.effect} onChange={(e) => patchOverlay(selOverlay.id, { effect: e.target.value })}>
+                  {EFFECTS.map((x) => <option key={x.id} value={x.id}>{x.label}</option>)}
+                </select>
+              </label>
+              <label>Strength {Math.round(selOverlay.amount * 100)}%
+                <input type="range" min={0} max={1} step={0.05} value={selOverlay.amount} onChange={(e) => patchOverlay(selOverlay.id, { amount: Number(e.target.value) })} />
+              </label>
+              <p className="hint">It changes everything on the tracks below it while it runs. Drag its ends on the timeline to change when.</p>
+            </div>
+          )}
           {selAudio && (
             <div className="form">
               <b>{selAudio.name}</b>
@@ -1796,7 +2011,7 @@ export function OwnEditor() {
               <p className="hint">Drag its edges on the timeline to trim.</p>
             </div>
           )}
-          {!selClip && !selOverlay && !selAudio && <p className="hint">Select something on the timeline.</p>}
+          {!selClip && !selOverlay && !selAudio && !joinClip && <p className="hint">Select something on the timeline.</p>}
           <h4>Captions</h4>
           <div className="form captions">
             <div className="pair">
@@ -1825,7 +2040,7 @@ export function OwnEditor() {
         </aside>
       </div>
 
-      <Timeline p={p} selected={selected} hover={hover} librarySrcs={librarySrcs} zoomStore={zoomStore} time={clock} act={act} trackRef={trackRef} />
+      <Timeline p={p} selected={selected} join={join} hover={hover} librarySrcs={librarySrcs} zoomStore={zoomStore} time={clock} act={act} trackRef={trackRef} />
 
       <div className="export">
         <h4>Export</h4>
@@ -1834,7 +2049,6 @@ export function OwnEditor() {
             <option value={720}>720p</option><option value={1080}>1080p</option>
           </select>
         </label>
-        <button disabled={!!busy} onClick={() => void runExport("mediabunny")}>Browser: Mediabunny</button>
         <button disabled={!!busy} onClick={() => void runExport("server")}>Server: FFmpeg</button>
         <button disabled={!!busy} className="minor" onClick={() => void runExport("wasm")} title="Kept for comparison only: slowest engine, and on one real clip its cuts landed 3 frames late">ffmpeg.wasm (comparison only)</button>
         {busy && <span className="prog">{busy} {Math.round(progress * 100)}%<progress value={progress} max={1} /></span>}
