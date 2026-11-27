@@ -5,6 +5,7 @@
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ALL_FORMATS, BlobSource, Input } from "mediabunny";
+import { DEFAULT_FONT, FONTS, fontFor } from "../../shared/fonts.js";
 import sample from "../../shared/sample-project.json";
 import { drawCover, drawOverlays, loadImage, preloadOverlayAssets } from "./compose";
 import { blobNames, exportFfmpegWasm, exportMediabunny, exportServer, type ExportResult } from "./exporters";
@@ -14,6 +15,12 @@ import {
 } from "./project";
 
 const STORAGE_KEY = "poc-own-editor-draft-v1";
+/**
+ * Edits longer than this are exported on the server, whatever button was pressed.
+ * Measured: a browser export of a 60 s 1080p60 recording took 81 to 86 s, and of a 4-minute one 472 s,
+ * while the server did the 4-minute one in about a minute. The browser also holds the whole result in memory.
+ */
+export const BROWSER_EXPORT_MAX_SECONDS = 60;
 const LIBRARY = [
   { name: "clipA_h264_16x9.mp4", kind: "video" },
   { name: "clipB_h264_9x16.mp4", kind: "video" },
@@ -90,8 +97,12 @@ async function probe(blob: Blob) {
     channels: audio?.numberOfChannels,
     codec: video?.codec ?? null,
     decodable: video ? await video.canDecode() : false,
+    hdr: video ? await video.hasHighDynamicRange() : false,
   };
 }
+
+const VIDEO_EXT = ["mp4", "mov", "webm", "avi", "mkv", "m4v", "3gp", "wmv", "flv", "mpg", "mpeg", "ts"];
+const AUDIO_EXT = ["mp3", "wav", "ogg", "m4a", "aac", "flac", "opus"];
 
 const fmt = (t: number) => `${Math.floor(t / 60)}:${(t % 60).toFixed(1).padStart(4, "0")}`;
 
@@ -121,6 +132,8 @@ export function OwnEditor() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const videos = useRef(new Map<string, HTMLVideoElement>());
   const musicEl = useRef<HTMLAudioElement | null>(null);
+  /** copy of the last video frame drawn, shown while the browser is busy seeking */
+  const lastFrame = useRef<HTMLCanvasElement | null>(null);
   const [W, H] = frameSize(p.aspect, 720);
 
   useEffect(() => void preloadOverlayAssets(p), [p]);
@@ -187,9 +200,21 @@ export function OwnEditor() {
       const cv = canvasRef.current;
       const ctx = cv?.getContext("2d");
       if (cv && ctx) {
-        ctx.fillStyle = "#000";
-        ctx.fillRect(0, 0, cv.width, cv.height);
-        if (active && active.readyState >= 2) drawCover(ctx, active, active.videoWidth, active.videoHeight, cv.width, cv.height);
+        const keep = (lastFrame.current ??= document.createElement("canvas"));
+        const sameSize = keep.width === cv.width && keep.height === cv.height;
+        if (active && active.readyState >= 2) {
+          ctx.fillStyle = "#000";
+          ctx.fillRect(0, 0, cv.width, cv.height);
+          drawCover(ctx, active, active.videoWidth, active.videoHeight, cv.width, cv.height);
+          if (!sameSize) (keep.width = cv.width), (keep.height = cv.height);
+          keep.getContext("2d")?.drawImage(cv, 0, 0);
+        } else if (sameSize) {
+          // mid-seek: hold the previous frame instead of flashing black
+          ctx.drawImage(keep, 0, 0);
+        } else {
+          ctx.fillStyle = "#000";
+          ctx.fillRect(0, 0, cv.width, cv.height);
+        }
         drawOverlays(ctx, proj, time, cv.width, cv.height);
       }
       raf = requestAnimationFrame(tick);
@@ -235,13 +260,34 @@ export function OwnEditor() {
     setSel(null);
   };
 
-  const addMedia = async (src: string, name: string, kind: "video" | "audio" | "image") => {
+  /**
+   * A file the browser cannot work with (AVI, an unsupported codec, HDR phone footage) is sent to the server,
+   * which returns a plain H.264 MP4. The editor then uses that copy like any other clip.
+   */
+  const convertOnServer = async (src: string, name: string, why: string) => {
+    setNotice(`${name}: ${why}. Converting it on the server...`);
+    let remote = src;
+    if (src.startsWith("blob:")) {
+      const up = await fetch(`/api/upload/${encodeURIComponent(name)}`, { method: "PUT", body: await (await fetch(src)).blob() });
+      remote = ((await up.json()) as { src: string }).src;
+    }
+    const r = await fetch("/api/convert", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ src: remote }) });
+    const body = (await r.json()) as { error?: string; src: string; ms: number };
+    if (!r.ok || body.error) throw new Error(body.error ?? `convert returned ${r.status}`);
+    return body;
+  };
+
+  const addMedia = async (src: string, name: string, kind: "video" | "audio" | "image", converted?: string) => {
     if (kind === "video") {
-      const info = await probe(await (await fetch(src)).blob());
-      if (!info.decodable) {
-        setNotice(`${name}: this browser cannot decode ${info.codec ?? "the video"}. Server export can still read it; in production we transcode on upload.`);
+      const info = await probe(await (await fetch(src)).blob()).catch(() => null);
+      const why = !info ? "the browser cannot open this file type" : !info.decodable ? `this browser cannot decode ${info.codec ?? "the video"}` : info.hdr ? "this is HDR video, which needs converting to standard colour" : null;
+      if (why) {
+        if (converted) throw new Error("the converted copy could not be opened either");
+        const done = await convertOnServer(src, name, why);
+        await addMedia(done.src, name, "video", `${name}: ${why}, so the server converted it to MP4 in ${(done.ms / 1000).toFixed(1)} s.`);
         return;
       }
+      if (!info) return;
       h.commit({ ...pRef.current, clips: [...pRef.current.clips, { id: uid(), name, src, in: 0, out: info.duration, srcDuration: info.duration, muted: false, hasAudio: info.hasAudio, channels: info.channels }] });
     } else if (kind === "audio") {
       const info = await probe(await (await fetch(src)).blob());
@@ -252,13 +298,20 @@ export function OwnEditor() {
       h.commit({ ...pRef.current, overlays: [...pRef.current.overlays, o] });
       setSel({ type: "overlay", id: o.id });
     }
-    setNotice(null);
+    setNotice(converted ?? null);
   };
   const onFiles = async (files: FileList | null) => {
     for (const f of Array.from(files ?? [])) {
       const url = URL.createObjectURL(f);
       blobNames.set(url, f.name);
-      await addMedia(url, f.name, f.type.startsWith("video") ? "video" : f.type.startsWith("audio") ? "audio" : "image");
+      const ext = f.name.split(".").pop()?.toLowerCase() ?? "";
+      const kind = f.type.startsWith("video") || VIDEO_EXT.includes(ext) ? "video" : f.type.startsWith("audio") || AUDIO_EXT.includes(ext) ? "audio" : "image";
+      try {
+        await addMedia(url, f.name, kind);
+      } catch (e) {
+        const reason = e instanceof Error ? e.message.trim().split(/\r?\n/).pop() : "unknown error";
+        setNotice(`${f.name}: could not be imported (${reason}).`);
+      }
     }
   };
   const addText = () => {
@@ -356,7 +409,12 @@ export function OwnEditor() {
   const [results, setResults] = useState<(ExportResult | { engine: string; error: string })[]>([]);
   const [lastUrl, setLastUrl] = useState<string | null>(null);
   const engines = { mediabunny: exportMediabunny, wasm: exportFfmpegWasm, server: exportServer } as const;
-  const runExport = async (key: keyof typeof engines) => {
+  const runExport = async (key: keyof typeof engines, force = false) => {
+    const length = totalDuration(pRef.current);
+    if (key !== "server" && length > BROWSER_EXPORT_MAX_SECONDS && !force) {
+      setNotice(`This edit is ${Math.round(length)} s long. Edits over ${BROWSER_EXPORT_MAX_SECONDS} s are exported on the server, which is several times faster for long videos.`);
+      key = "server";
+    }
     setPlaying(false);
     setBusy(key);
     setProgress(0);
@@ -415,6 +473,7 @@ export function OwnEditor() {
         <button onClick={removeSelected} disabled={!sel}>Delete</button>
         <button onClick={h.undo} disabled={!h.canUndo}>Undo</button>
         <button onClick={h.redo} disabled={!h.canRedo}>Redo</button>
+        <button onClick={() => (setPlaying(false), setSel(null), h.commit(sample as Project), seek(0))} title="Back to the sample edit (Undo brings your edit back)">Reset</button>
         <span className="sep" />
         <label>Aspect{" "}
           <select value={p.aspect} onChange={(e) => h.commit({ ...p, aspect: e.target.value as Aspect })}>
@@ -423,7 +482,7 @@ export function OwnEditor() {
         </label>
         <button onClick={addText}>+ Text</button>
         <label className="file">Import files
-          <input type="file" multiple accept="video/mp4,video/quicktime,video/webm,image/*,audio/*" onChange={(e) => void onFiles(e.target.files)} />
+          <input type="file" multiple accept="video/*,image/*,audio/*,.avi,.mkv,.mov,.m4v,.3gp" onChange={(e) => void onFiles(e.target.files)} />
         </label>
         <span className="saved">{h.savedAt ? `Draft saved ${h.savedAt}` : "Not saved yet"}</span>
       </div>
@@ -457,6 +516,14 @@ export function OwnEditor() {
           {selOverlay?.kind === "text" && (
             <div className="form">
               <label>Text<input value={selOverlay.text} onChange={(e) => patchOverlay(selOverlay.id, { text: e.target.value })} /></label>
+              <label>Font
+                <select value={selOverlay.font ?? DEFAULT_FONT} onChange={(e) => patchOverlay(selOverlay.id, { font: e.target.value })}>
+                  {FONTS.map((f) => <option key={f.id} value={f.id}>{f.label}</option>)}
+                </select>
+              </label>
+              {fontFor(selOverlay.text, selOverlay.font).id !== (selOverlay.font ?? DEFAULT_FONT) && (
+                <p className="hint">This font has no Hindi letters, so {fontFor(selOverlay.text, selOverlay.font).label} is used for this title.</p>
+              )}
               <label>Size<input type="range" min={16} max={120} value={selOverlay.fontSize} onChange={(e) => patchOverlay(selOverlay.id, { fontSize: Number(e.target.value) })} /></label>
               <label>Colour<input type="color" value={selOverlay.color} onChange={(e) => patchOverlay(selOverlay.id, { color: e.target.value.toUpperCase() })} /></label>
               <p className="hint">Drag on the preview to position.</p>
@@ -527,8 +594,8 @@ export function OwnEditor() {
           </select>
         </label>
         <button disabled={!!busy} onClick={() => void runExport("mediabunny")}>Browser: Mediabunny</button>
-        <button disabled={!!busy} onClick={() => void runExport("wasm")}>Browser: ffmpeg.wasm</button>
         <button disabled={!!busy} onClick={() => void runExport("server")}>Server: FFmpeg</button>
+        <button disabled={!!busy} className="minor" onClick={() => void runExport("wasm")} title="Kept for comparison only: slowest engine, and on one real clip its cuts landed 3 frames late">ffmpeg.wasm (comparison only)</button>
         {busy && <span className="prog">{busy} {Math.round(progress * 100)}%<progress value={progress} max={1} /></span>}
       </div>
       {results.length > 0 && (

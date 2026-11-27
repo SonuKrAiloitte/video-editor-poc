@@ -34,6 +34,8 @@ export interface TextOverlay extends OverlayBase {
   /** px when the short side of the frame is 720; scaled for 1080p */
   fontSize: number;
   color: string;
+  /** id from shared/fonts.js; missing means the default font */
+  font?: string;
 }
 export interface ImageOverlay extends OverlayBase {
   kind: "image";

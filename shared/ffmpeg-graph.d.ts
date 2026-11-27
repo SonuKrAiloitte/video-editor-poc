@@ -3,5 +3,5 @@ export const SIZES: Record<string, Record<number, [number, number]>>;
 export function projectDuration(p: Project): number;
 export function buildFfmpegArgs(
   project: Project,
-  opts: { height: 720 | 1080; resolve: (src: string) => string; font: string; output: string; preset?: string },
+  opts: { height: 720 | 1080; resolve: (src: string) => string; font: string | ((fileName: string) => string); output: string; preset?: string; seek?: "input" | "filter" },
 ): { args: string[]; width: number; height: number; duration: number };

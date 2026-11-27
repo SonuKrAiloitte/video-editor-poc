@@ -77,3 +77,5 @@ h4 { margin: 10px 0 6px; font-size: 12px; text-transform: uppercase; letter-spac
 .twick-wrap { flex: 1; min-height: 0; overflow-y: auto; }
 .twick-log { padding: 6px 14px; background: var(--sky); color: var(--text); font-size: 12px; }
 .twick-host { height: 100vh; position: relative; }
+
+button.minor { font-size: 12px; border-style: dashed; opacity: 0.8; }

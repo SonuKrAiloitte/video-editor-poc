@@ -12,7 +12,8 @@ import { FFmpeg } from "@ffmpeg/ffmpeg";
 import coreURL from "@ffmpeg/core?url";
 import wasmURL from "@ffmpeg/core/wasm?url";
 import { buildFfmpegArgs } from "../../shared/ffmpeg-graph.js";
-import { drawOverlays, preloadOverlayAssets } from "./compose";
+import { fontFor, needsRaster } from "../../shared/fonts.js";
+import { drawOverlays, preloadOverlayAssets, rasteriseTitle } from "./compose";
 import { clipLen, clipStarts, frameSize, totalDuration, type Project } from "./project";
 
 export interface ExportResult {
@@ -27,6 +28,20 @@ export interface ExportResult {
 type Progress = (fraction: number) => void;
 
 const FPS = 30;
+
+/**
+ * Titles FFmpeg cannot shape (Hindi and other joining scripts) become pictures: each is drawn to a PNG here
+ * in the browser and swapped for an image overlay at the same place and time. `store` says where the PNG goes.
+ */
+async function withRasterTitles(p: Project, height: 720 | 1080, store: (png: Blob) => Promise<string>): Promise<Project> {
+  const [W, H] = frameSize(p.aspect, height);
+  const overlays = await Promise.all(p.overlays.map(async (o) => {
+    if (o.kind !== "text" || !needsRaster(o.text)) return o;
+    const { blob, width } = await rasteriseTitle(o, W, H);
+    return { id: o.id, kind: "image" as const, src: await store(blob), width: width / W, x: o.x, y: o.y, start: o.start, end: o.end };
+  }));
+  return { ...p, overlays };
+}
 const fetchBlob = (src: string) => fetch(src).then((r) => r.blob());
 
 // ---------------------------------------------------------------- 1. Mediabunny
@@ -77,7 +92,8 @@ export async function exportMediabunny(p: Project, height: 720 | 1080, onProgres
     const track = await input.getPrimaryVideoTrack();
     if (!track) throw new Error(`${clip.name}: no video track`);
     if (!(await track.canDecode())) throw new Error(`${clip.name}: this browser cannot decode ${track.codec}`);
-    const sink = new CanvasSink(track, { width: W, height: H, fit: "cover" });
+    // poolSize: reuse a few canvases instead of allocating one per frame (matters on long exports)
+    const sink = new CanvasSink(track, { width: W, height: H, fit: "cover", poolSize: 3 });
     const n = Math.round(clipLen(clip) * FPS);
     const stamps = Array.from({ length: n }, (_, k) => clip.in + k / FPS);
     for await (const wrapped of sink.canvasesAtTimestamps(stamps)) {
@@ -100,8 +116,13 @@ export async function exportMediabunny(p: Project, height: 720 | 1080, onProgres
 
 // ---------------------------------------------------------------- 2. ffmpeg.wasm
 let wasm: FFmpeg | null = null;
-export async function exportFfmpegWasm(p: Project, height: 720 | 1080, onProgress: Progress): Promise<ExportResult> {
+export async function exportFfmpegWasm(original: Project, height: 720 | 1080, onProgress: Progress): Promise<ExportResult> {
   const t0 = performance.now();
+  const p = await withRasterTitles(original, height, async (png) => {
+    const url = URL.createObjectURL(png);
+    blobNames.set(url, "title.png");
+    return url;
+  });
   if (!wasm) {
     wasm = new FFmpeg();
     await wasm.load({ coreURL, wasmURL });
@@ -114,9 +135,10 @@ export async function exportFfmpegWasm(p: Project, height: 720 | 1080, onProgres
     if (!names.has(src)) names.set(src, `in${names.size}.${ext}`);
     return names.get(src)!;
   };
-  const { args, width, height: h, duration } = buildFfmpegArgs(p, { height, resolve, font: "font.ttf", output: "out.mp4", preset: "ultrafast" });
+  const { args, width, height: h, duration } = buildFfmpegArgs(p, { height, resolve, font: (file) => file, output: "out.mp4", preset: "ultrafast", seek: (globalThis as { __wasmSeek?: "input" | "filter" }).__wasmSeek });
   const put = async (name: string, src: string) => ff.writeFile(name, new Uint8Array(await (await fetch(src)).arrayBuffer()));
-  await put("font.ttf", "/fonts/PlusJakartaSans.ttf");
+  const fontFiles = new Set(p.overlays.flatMap((o) => (o.kind === "text" ? [fontFor(o.text, o.font).file] : [])));
+  for (const file of fontFiles) await put(file, `/fonts/${file}`);
   for (const [src, name] of names) await put(name, src);
 
   const onProg = ({ progress }: { progress: number }) => onProgress(Math.min(1, Math.max(0, progress)));
@@ -146,6 +168,9 @@ export async function exportServer(p: Project, height: 720 | 1080, onProgress: P
     }
     return uploaded.get(src)!;
   };
+  const upload = async (body: Blob, name: string) =>
+    ((await (await fetch(`/api/upload/${encodeURIComponent(name)}`, { method: "PUT", body })).json()) as { src: string }).src;
+  p = await withRasterTitles(p, height, (png) => upload(png, "title.png"));
   const project: Project = {
     ...p,
     clips: await Promise.all(p.clips.map(async (c) => ({ ...c, src: await remote(c.src) }))),

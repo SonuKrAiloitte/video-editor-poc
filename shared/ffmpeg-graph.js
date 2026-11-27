@@ -2,6 +2,8 @@
 // Turns our edit JSON (see src/own/project.ts) into FFmpeg arguments.
 // One builder, two runtimes: this is what keeps server and browser exports identical.
 
+import { fontFor } from "./fonts.js";
+
 export const SIZES = {
   "16:9": { 720: [1280, 720], 1080: [1920, 1080] },
   "9:16": { 720: [720, 1280], 1080: [1080, 1920] },
@@ -23,9 +25,10 @@ const widen = (channels) => (channels === 1 ? "pan=stereo|c0=c0|c1=c0," : "");
  * @param project   edit JSON
  * @param opts.height   720 | 1080
  * @param opts.resolve  (src) => path FFmpeg should open
- * @param opts.font     path to the .ttf FFmpeg should use for text
+ * @param opts.font     (fileName) => path of that .ttf for FFmpeg; a plain string is used for every title
  * @param opts.output   output file name
  * @param opts.preset   x264 preset
+ * @param opts.seek     "input" (default) | "filter"
  */
 export function buildFfmpegArgs(project, opts) {
   const [W, H] = SIZES[project.aspect][opts.height];
@@ -38,17 +41,25 @@ export function buildFfmpegArgs(project, opts) {
   const pairs = [];
   for (const c of project.clips) {
     const vi = idx++;
+    const len = n(c.out - c.in);
+    // Seek on the INPUT, so FFmpeg jumps to the clip instead of decoding the file from its start.
+    // (A 5 s clip taken from the end of a 4-minute recording took 17 s with a filter-only trim.)
+    // opts.seek = "filter" keeps the old behaviour (decode from the start, cut in the filter graph).
+    const inputSeek = opts.seek !== "filter";
+    if (inputSeek && c.in > 0) args.push("-ss", String(n(c.in)));
+    if (inputSeek) args.push("-t", String(n(len + 0.5)));
     args.push("-i", opts.resolve(c.src));
+    const cut = inputSeek ? `end=${len}` : `start=${n(c.in)}:end=${n(c.out)}`;
     f.push(
-      `[${vi}:v]trim=start=${n(c.in)}:end=${n(c.out)},setpts=PTS-STARTPTS,` +
+      `[${vi}:v]trim=${cut},setpts=PTS-STARTPTS,` +
         `scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},fps=30,setsar=1,format=yuv420p[v${vi}]`,
     );
     const vol = c.muted ? 0 : project.originalVolume;
     if (c.hasAudio === false) {
-      f.push(`anullsrc=r=48000:cl=stereo,atrim=0:${n(c.out - c.in)}[a${vi}]`);
+      f.push(`anullsrc=r=48000:cl=stereo,atrim=0:${len}[a${vi}]`);
     } else {
       f.push(
-        `[${vi}:a]atrim=start=${n(c.in)}:end=${n(c.out)},asetpts=PTS-STARTPTS,volume=${n(vol)},${widen(c.channels)}` +
+        `[${vi}:a]atrim=${cut},asetpts=PTS-STARTPTS,volume=${n(vol)},${widen(c.channels)}` +
           `aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a${vi}]`,
       );
     }
@@ -64,8 +75,10 @@ export function buildFfmpegArgs(project, opts) {
     const out = `ov${k++}`;
     if (o.kind === "text") {
       const size = Math.round(o.fontSize * (Math.min(W, H) / 720));
+      const file = fontFor(o.text, o.font).file;
+      const fontfile = typeof opts.font === "function" ? opts.font(file) : opts.font;
       f.push(
-        `[${last}]drawtext=expansion=none:fontfile=${opts.font}:text='${esc(o.text)}':fontsize=${size}:fontcolor=${o.color.replace("#", "0x")}:` +
+        `[${last}]drawtext=expansion=none:fontfile=${fontfile}:text='${esc(o.text)}':fontsize=${size}:fontcolor=${o.color.replace("#", "0x")}:` +
           `x=${n(o.x)}*w-text_w/2:y=${n(o.y)}*h-text_h/2:${gate}[${out}]`,
       );
     } else {
@@ -94,6 +107,9 @@ export function buildFfmpegArgs(project, opts) {
     "-filter_complex", f.join(";"),
     "-map", `[${last}]`, "-map", `[${alast}]`,
     "-c:v", "libx264", "-preset", opts.preset ?? "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+    // Say which colour standard the file uses. Without it a source that carries no colour tag produces an
+    // untagged export, and players then guess (a browser and FFmpeg guessed differently in testing).
+    "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
     "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", "-t", String(n(total)),
     opts.output,
   );
