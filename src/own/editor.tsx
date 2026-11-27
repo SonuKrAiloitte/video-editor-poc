@@ -8,7 +8,7 @@
  *   - the main track keeps its clips joined end to end; the tracks above take video, image and text anywhere;
  *     the tracks below take audio only. A drop on the wrong kind of track is refused with a reason.
  */
-import { useCallback, useEffect, useRef, useState } from "react";
+import { memo, startTransition, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { ALL_FORMATS, BlobSource, Input } from "mediabunny";
 import { DEFAULT_FONT, FONTS, fontFor } from "../../shared/fonts.js";
 import { RATIOS, applyTrackStates, audioLen, canPlace, layers, normalizeProject, overlapsOnTrack, refuseReason, resolveAspect, type ItemKind } from "../../shared/model.js";
@@ -40,6 +40,8 @@ interface Media {
   channels?: number;
   /** width / height of the picture */
   ratio?: number;
+  /** a light 720p / 30 fps copy the server made for the preview (exports read `src`) */
+  proxy?: string;
 }
 const BUILT_IN = [
   { name: "clipA_h264_16x9.mp4", kind: "video" },
@@ -219,6 +221,286 @@ function TrackHead({ name, kind, state, onToggle }: { name: string; kind: "visua
   );
 }
 
+// ------------------------------------------------------------------ speed helpers
+/**
+ * A value kept outside React state, for things that change every frame (the playhead time) or that only a small part
+ * of the page shows (the timeline zoom). Only the components that read it with useValue re-render when it changes.
+ */
+function createStore<T>(initial: T) {
+  let value = initial;
+  const subs = new Set<() => void>();
+  return {
+    get: () => value,
+    set: (next: T) => {
+      if (Object.is(next, value)) return;
+      value = next;
+      subs.forEach((f) => f());
+    },
+    subscribe: (f: () => void) => (subs.add(f), () => void subs.delete(f)),
+  };
+}
+type Store<T> = ReturnType<typeof createStore<T>>;
+const useValue = <T,>(s: Store<T>) => useSyncExternalStore(s.subscribe, s.get);
+
+/**
+ * Pointer moves come much faster than the screen redraws on a slow laptop. This runs `fn` at most once a frame with the
+ * latest event; `flush` runs a waiting one at once (on release, so the drop lands where the pointer was let go).
+ */
+function perFrame<E>(fn: (e: E) => void) {
+  let last: E | null = null;
+  let raf = 0;
+  const run = () => {
+    raf = 0;
+    if (!last) return;
+    const e = last;
+    last = null;
+    fn(e);
+  };
+  const call = (e: E) => {
+    last = e;
+    if (!raf) raf = requestAnimationFrame(run);
+  };
+  return Object.assign(call, { flush: () => (raf && cancelAnimationFrame(raf), run()) });
+}
+
+/**
+ * The same object on every render, whose functions call the latest version of `fns`. Lets the timeline blocks be
+ * memoised: their handlers never change, yet always see the current edit.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function useActions<T extends Record<string, (...args: any[]) => any>>(fns: T): T {
+  const ref = useRef(fns);
+  ref.current = fns;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  return useMemo(() => Object.fromEntries(Object.keys(fns).map((k) => [k, (...a: unknown[]) => ref.current[k]!(...a)])) as T, []);
+}
+
+/** the playhead time as text, HH:MM:SS:FF */
+function TimeText({ time, total }: { time: Store<number>; total: number }) {
+  const t = useValue(time);
+  return <span className="time"><b>{fmt(t)}</b> / {fmt(total)}</span>;
+}
+
+/**
+ * A text box that does not rebuild the whole editor on every key: it keeps what is typed itself and hands it to the
+ * edit a moment after typing pauses (or when it loses focus). A burst of typing is one Undo step.
+ */
+function LiveText({ value, onStart, onLive, ...rest }: Omit<React.InputHTMLAttributes<HTMLInputElement>, "value" | "onChange"> & {
+  value: string;
+  /** before the first change of a burst (take the Undo checkpoint here) */
+  onStart: () => void;
+  /** the text so far, applied to the edit without an Undo step */
+  onLive: (text: string) => void;
+}) {
+  const [draft, setDraft] = useState(value);
+  const typing = useRef(false);
+  const timer = useRef(0);
+  const idle = useRef(0);
+  const latest = useRef(value);
+  const live = useRef(onLive);
+  live.current = onLive;
+  // a change from outside (Undo, another field, a different caption) shows here when not typing
+  useEffect(() => {
+    if (!typing.current) setDraft(value);
+  }, [value]);
+  const push = () => {
+    window.clearTimeout(timer.current);
+    timer.current = 0;
+    startTransition(() => live.current(latest.current));
+  };
+  const end = () => {
+    if (timer.current) push();
+    typing.current = false;
+  };
+  useEffect(() => () => end(), []); // eslint-disable-line react-hooks/exhaustive-deps
+  return (
+    <input
+      {...rest}
+      value={draft}
+      onChange={(e) => {
+        if (!typing.current) (typing.current = true), onStart();
+        latest.current = e.target.value;
+        setDraft(e.target.value);
+        window.clearTimeout(timer.current);
+        timer.current = window.setTimeout(push, 120);
+        window.clearTimeout(idle.current);
+        idle.current = window.setTimeout(end, 1000); // a pause of a second starts a new Undo step
+      }}
+      onBlur={(e) => (end(), rest.onBlur?.(e))}
+    />
+  );
+}
+
+// ------------------------------------------------------------------ timeline (memoised: it re-renders only when the edit,
+// the selection, the drop target or the zoom changes, and each block only when its own item changes)
+type TimelineActions = {
+  grabClip: (e: React.PointerEvent, i: number) => void;
+  trimClip: (e: React.PointerEvent, c: Clip, i: number, edge: "in" | "out") => void;
+  grabOverlay: (e: React.PointerEvent, o: Overlay) => void;
+  trimOverlay: (e: React.PointerEvent, o: Overlay, edge: "start" | "end") => void;
+  grabAudio: (e: React.PointerEvent, a: AudioItem) => void;
+  trimAudio: (e: React.PointerEvent, a: AudioItem, edge: "start" | "end") => void;
+  startBox: (e: React.PointerEvent) => void;
+  scrub: (e: React.PointerEvent) => void;
+  toggleTrack: (row: RowId, key: keyof TrackState) => void;
+};
+/** a block's place in time; CSS turns it into pixels with the zoom (--z on .tl), so zooming does not re-render blocks */
+const at = (start: number, len: number) => ({ "--s": start, "--d": len }) as React.CSSProperties;
+
+const ClipBlock = memo(function ClipBlock({ c, i, start, sel, lost, act }: { c: Clip; i: number; start: number; sel: boolean; lost: boolean; act: TimelineActions }) {
+  return (
+    <div data-ref={`clip:${c.id}`} className={`clip ${c.kind === "image" ? "image" : "video"} ${sel ? "sel" : ""} ${lost ? "lost" : ""}`} style={at(start, clipLen(c))} onPointerDown={(e) => act.grabClip(e, i)}>
+      <i className="h l" onPointerDown={(e) => act.trimClip(e, c, i, "in")} />
+      <span>{c.muted ? "(muted) " : ""}{c.name}</span>
+      <i className="h r" onPointerDown={(e) => act.trimClip(e, c, i, "out")} />
+    </div>
+  );
+});
+const OverlayBlock = memo(function OverlayBlock({ o, sel, lost, act }: { o: Overlay; sel: boolean; lost: boolean; act: TimelineActions }) {
+  return (
+    <div data-ref={`overlay:${o.id}`} className={`clip ${o.kind} ${sel ? "sel" : ""} ${lost ? "lost" : ""}`} style={at(o.start, o.end - o.start)} onPointerDown={(e) => act.grabOverlay(e, o)}>
+      <i className="h l" onPointerDown={(e) => act.trimOverlay(e, o, "start")} />
+      <span>{o.kind === "text" ? o.text : o.kind === "video" ? o.name : (o as ImageOverlay).src.split("/").pop()}</span>
+      <i className="h r" onPointerDown={(e) => act.trimOverlay(e, o, "end")} />
+    </div>
+  );
+});
+const AudioBlock = memo(function AudioBlock({ a, sel, lost, act }: { a: AudioItem; sel: boolean; lost: boolean; act: TimelineActions }) {
+  return (
+    <div data-ref={`audio:${a.id}`} className={`clip audio ${sel ? "sel" : ""} ${lost ? "lost" : ""}`} style={at(a.start, audioLen(a))} onPointerDown={(e) => act.grabAudio(e, a)}>
+      <i className="h l" onPointerDown={(e) => act.trimAudio(e, a, "start")} />
+      <span>{a.name} ({Math.round(a.volume * 100)}%)</span>
+      <i className="h r" onPointerDown={(e) => act.trimAudio(e, a, "end")} />
+    </div>
+  );
+});
+
+/** label spacing: the first step that leaves room for a label at this zoom */
+const RULER_STEPS = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600];
+const rulerLabel = (s: number) => (s < 60 ? `${s}s` : `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`);
+/** Ruler labels only for the part of the timeline on screen, spaced to fit the zoom (1 s, 5 s, 30 s, 1 min, …). */
+const Ruler = memo(function Ruler({ zoom, length, left, view, onScrub }: { zoom: number; length: number; left: number; view: number; onScrub: (e: React.PointerEvent) => void }) {
+  const step = RULER_STEPS.find((s) => s * zoom >= 56) ?? 600;
+  const from = Math.max(0, Math.floor(left / zoom / step) * step);
+  const to = Math.min(length, (left + view) / zoom + step);
+  const marks: number[] = [];
+  for (let s = from; s <= to; s += step) marks.push(s);
+  return (
+    <div className="ruler" onPointerDown={onScrub}>
+      {marks.map((s) => <span key={s} style={{ left: s * zoom }}>{rulerLabel(s)}</span>)}
+    </div>
+  );
+});
+/** the red playhead line; it follows the time on its own, without re-rendering the timeline */
+function Playhead({ time, zoom, onScrub }: { time: Store<number>; zoom: number; onScrub: (e: React.PointerEvent) => void }) {
+  const t = useValue(time);
+  return (
+    <div className="playhead" style={{ left: t * zoom }}>
+      <span className="knob" onPointerDown={onScrub} title="Drag to move the playhead" />
+    </div>
+  );
+}
+/** the zoom slider moves at once; the timeline follows at most once a frame */
+function ZoomSlider({ store }: { store: Store<number> }) {
+  const [v, setV] = useState(store.get());
+  const push = useMemo(() => perFrame((n: number) => store.set(n)), [store]);
+  return <label>Zoom <input type="range" min={20} max={200} value={v} onChange={(e) => (setV(Number(e.target.value)), push(Number(e.target.value)))} /></label>;
+}
+
+const Timeline = memo(function Timeline({ p, selected, hover, librarySrcs, zoomStore, time, act, trackRef }: {
+  p: Project;
+  selected: Ref[];
+  hover: { row: RowId; ok: boolean } | null;
+  librarySrcs: Set<string>;
+  zoomStore: Store<number>;
+  time: Store<number>;
+  act: TimelineActions;
+  trackRef: React.RefObject<HTMLDivElement | null>;
+}) {
+  const zoom = useValue(zoomStore);
+  const length = Math.max(totalDuration(p) + 4, 12);
+  const width = length * zoom;
+  const starts = clipStarts(p);
+  const visualTracks = p.tracks.filter((x) => x.kind === "visual");
+  const audioTracks = p.tracks.filter((x) => x.kind === "audio");
+  const isSel = (id: string) => selected.some((x) => x.id === id);
+  const missing = (src: string) => isMissing(src, librarySrcs);
+  const rowClass = (row: RowId, extra = "") => `track ${extra} ${hover?.row === row ? (hover.ok ? "drop-ok" : "drop-bad") : ""}`;
+  const rowEvents = (row: RowId) => ({ "data-row": row, onPointerDown: act.startBox });
+  const stateOf = (row: RowId): TrackState => (row === "main" ? p.main ?? {} : p.tracks.find((x) => x.id === row) ?? {});
+  const rowState = (row: RowId) => `${stateOf(row).locked ? "is-locked" : ""} ${stateOf(row).hidden ? "is-hidden" : ""} ${stateOf(row).muted ? "is-muted" : ""}`;
+  // which part of the timeline is on screen, for the ruler
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const [view, setView] = useState({ left: 0, w: 2000 });
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const update = perFrame(() => setView((v) => (v.left === el.scrollLeft && v.w === el.clientWidth ? v : { left: el.scrollLeft, w: el.clientWidth })));
+    update(0);
+    el.addEventListener("scroll", update, { passive: true });
+    window.addEventListener("resize", update);
+    return () => (el.removeEventListener("scroll", update), window.removeEventListener("resize", update));
+  }, []);
+  return (
+    <>
+      <div className="tl-head">
+        <span>Timeline</span>
+        <ZoomSlider store={zoomStore} />
+        <span className="hint">Drag from the Library onto any track. Drag clips sideways or onto another track. The main track keeps clips joined; audio goes only on audio tracks.</span>
+      </div>
+      <div className="tl-wrap">
+        <div className="tl-labels">
+          <div className="ruler" />
+          {visualTracks.map((tr, n) => <TrackHead key={tr.id} name={tr.role === "captions" ? "Captions" : `Track ${visualTracks.length - n + 1}`} kind="visual" state={tr} onToggle={(k) => act.toggleTrack(tr.id, k)} />)}
+          <TrackHead name="Main" kind="main" state={p.main ?? {}} onToggle={(k) => act.toggleTrack("main", k)} />
+          {audioTracks.map((tr, n) => <TrackHead key={tr.id} name={`Audio ${n + 1}`} kind="audio" state={tr} onToggle={(k) => act.toggleTrack(tr.id, k)} />)}
+          <div className="track new">New</div>
+        </div>
+        <div className="tl-scroll" ref={scrollRef}>
+          <div className="tl" style={{ width, "--z": zoom } as React.CSSProperties} ref={trackRef}>
+            <Ruler zoom={zoom} length={length} left={view.left} view={view.w} onScrub={act.scrub} />
+            {visualTracks.map((tr, n) => (
+              <div key={tr.id} className={rowClass(tr.id, `visual ${rowState(tr.id)}`)} data-label={`Track ${visualTracks.length - n + 1}`} {...rowEvents(tr.id)}>
+                {p.overlays.filter((o) => o.track === tr.id).map((o) => (
+                  <OverlayBlock key={o.id} o={o} sel={isSel(o.id)} lost={o.kind !== "text" && missing(o.src)} act={act} />
+                ))}
+              </div>
+            ))}
+            <div className={rowClass("main", `main ${rowState("main")}`)} data-label="Main" {...rowEvents("main")}>
+              {p.clips.map((c, i) => <ClipBlock key={c.id} c={c} i={i} start={starts[i] ?? 0} sel={isSel(c.id)} lost={missing(c.src)} act={act} />)}
+              {mainLength(p) === 0 && <span className="empty">Drop video or images here</span>}
+            </div>
+            {audioTracks.map((tr, n) => (
+              <div key={tr.id} className={rowClass(tr.id, `audio ${rowState(tr.id)}`)} data-label={`Audio ${n + 1}`} {...rowEvents(tr.id)}>
+                {p.audios.filter((a) => a.track === tr.id).map((a) => <AudioBlock key={a.id} a={a} sel={isSel(a.id)} lost={missing(a.src)} act={act} />)}
+              </div>
+            ))}
+            <div className={rowClass("new", "new")} data-label="New" {...rowEvents("new")}>
+              <span className="empty">Drop here for a new track</span>
+            </div>
+            <Playhead time={time} zoom={zoom} onScrub={act.scrub} />
+          </div>
+        </div>
+      </div>
+    </>
+  );
+});
+
+/** the move / resize / rotate box over the selected item on the preview; follows the playhead on its own */
+type SelRect = { left: number; top: number; width: number; height: number; rot: number };
+function SelectionBox({ time, rectAt, onPress }: { time: Store<number>; rectAt: (t: number) => SelRect | null; onPress: (e: React.PointerEvent, mode: "move" | "scale" | "turn") => void }) {
+  const b = rectAt(useValue(time));
+  if (!b) return null;
+  return (
+    <div className="tbox" style={{ left: b.left, top: b.top, width: b.width, height: b.height, transform: `rotate(${b.rot}deg)` }} onPointerDown={(e) => onPress(e, "move")}>
+      {(["nw", "ne", "sw", "se"] as const).map((c) => (
+        <span key={c} className={`corner ${c}`} title="Drag to resize" onPointerDown={(e) => onPress(e, "scale")} />
+      ))}
+      <span className="turn" title="Drag to rotate (hold Shift for 15° steps)" onPointerDown={(e) => onPress(e, "turn")}>⟳</span>
+    </div>
+  );
+}
+
 /** a small box drawn in the shape of a ratio, for the ratio menu */
 const RatioIcon = ({ aspect }: { aspect: string }) => {
   const [w, h] = aspect.split(":").map(Number);
@@ -232,12 +514,16 @@ type Ref = { type: "clip" | "overlay" | "audio"; id: string };
 type RowId = string; // track id, "main" or "new"
 
 export function OwnEditor() {
+  /** how many times the whole editor has rendered (read by the speed checks) */
+  const renders = useRef(0);
+  renders.current++;
   const h = useHistory();
   const p = h.project;
   const total = totalDuration(p);
-  const mainLen = mainLength(p);
 
-  const [t, setT] = useState(0);
+  /** the playhead time and the timeline zoom (px per second), outside React state; see createStore */
+  const clock = useMemo(() => createStore(0), []);
+  const zoomStore = useMemo(() => createStore(60), []);
   const [playing, setPlaying] = useState(false);
   /** everything selected on the timeline; the last one picked is the one the Inspector shows */
   const [selected, setSelected] = useState<Ref[]>([]);
@@ -248,10 +534,12 @@ export function OwnEditor() {
   const [box, setBox] = useState<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
   /** a Library file playing in the player, before it is put on the timeline */
   const [libPreview, setLibPreview] = useState<Media | null>(null);
-  const [zoom, setZoom] = useState(60); // px per second
   const [notice, setNotice] = useState<string | null>(null);
   /** row the pointer is over during a drag, and whether the dragged thing may go there */
-  const [hover, setHover] = useState<{ row: RowId; ok: boolean } | null>(null);
+  const [hover, setHoverState] = useState<{ row: RowId; ok: boolean } | null>(null);
+  /** only re-render when the drop target really changes, not on every pointer move */
+  const setHover = useCallback((next: { row: RowId; ok: boolean } | null) =>
+    setHoverState((cur) => (cur === next || (cur && next && cur.row === next.row && cur.ok === next.ok) ? cur : next)), []);
   const [library, setLibrary] = useState<Media[]>(loadLibrary);
   /** files being imported, by name, with what is happening to them; shown as rows in the Library */
   const [pending, setPending] = useState<Record<string, { kind: Media["kind"]; step: string }>>({});
@@ -262,10 +550,26 @@ export function OwnEditor() {
       else delete next[name];
       return next;
     });
-  const librarySrcs = new Set(library.map((m) => m.src));
+  const librarySrcs = useMemo(() => new Set(library.map((m) => m.src)), [library]);
   const libRef = useRef(library);
   libRef.current = library;
-  const missing = (src: string) => isMissing(src, librarySrcs);
+  /** the file the preview plays: the light proxy once the server has made it, else the original */
+  const viewSrc = (src: string) => libRef.current.find((m) => m.src === src)?.proxy ?? src;
+  /** ask the server for the preview proxy of an uploaded video and wait for it (it is made in the background) */
+  const watchProxy = useCallback(async (src: string) => {
+    for (let i = 0; i < 900; i++) {
+      const r = (await fetch("/api/proxy", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ src }) })
+        .then((x) => x.json())
+        .catch(() => ({ status: "failed" }))) as { status: string; proxy?: string };
+      if (r.status === "ready" && r.proxy) return void setLibrary((lib) => lib.map((m) => (m.src === src ? { ...m, proxy: r.proxy } : m)));
+      if (r.status !== "working") return;
+      await new Promise((ok) => setTimeout(ok, 1500));
+    }
+  }, []);
+  // files imported before proxies existed (or while the server was making one) get theirs now
+  useEffect(() => {
+    for (const m of libRef.current) if (m.kind === "video" && !m.proxy && m.src.startsWith("/out/uploads/")) void watchProxy(m.src);
+  }, [watchProxy]);
   useEffect(() => {
     try {
       localStorage.setItem(LIBRARY_KEY, JSON.stringify(library));
@@ -285,8 +589,8 @@ export function OwnEditor() {
 
   const seek = useCallback((next: number) => {
     tRef.current = Math.max(0, Math.min(totalDuration(pRef.current), next));
-    setT(tRef.current);
-  }, []);
+    clock.set(tRef.current);
+  }, [clock]);
 
   // ------------------------------------------------------------------ preview
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -295,6 +599,8 @@ export function OwnEditor() {
   const audioEls = useRef(new Map<string, HTMLAudioElement>());
   /** copy of the last main-track frame drawn, shown while the browser is busy seeking */
   const lastFrame = useRef<HTMLCanvasElement | null>(null);
+  /** which picture lastFrame holds, so it is copied once per new picture and not on every frame */
+  const keepKey = useRef("");
   const [W, H] = frameSize(p, 720);
   const [ratioOpen, setRatioOpen] = useState(false);
   const playerRef = useRef<HTMLDivElement>(null);
@@ -330,7 +636,8 @@ export function OwnEditor() {
         if (!(el as HTMLVideoElement).seeking && Math.abs(el.currentTime - target) > 0.03) el.currentTime = target;
       }
     };
-    const videoFor = (key: string, src: string) => {
+    const videoFor = (key: string, original: string) => {
+      const src = viewSrc(original);
       let v = videos.current.get(key);
       if (!v || !v.src.endsWith(src)) {
         v?.pause();
@@ -350,12 +657,12 @@ export function OwnEditor() {
       const dur = totalDuration(proj);
       if (playRef.current) {
         tRef.current = Math.min(dur, tRef.current + dt);
-        setT(tRef.current);
+        clock.set(tRef.current);
         if (tRef.current >= dur) setPlaying(false);
       } else if (tRef.current > dur) {
         // a trim or delete shortened the video: keep the playhead inside it
         tRef.current = dur;
-        setT(dur);
+        clock.set(dur);
       }
       const time = tRef.current;
       const hit = clipAt(proj, Math.min(time, Math.max(0, dur - 0.001)));
@@ -402,18 +709,27 @@ export function OwnEditor() {
 
       const cv = canvasRef.current;
       const ctx = cv?.getContext("2d");
-      if (cv && ctx) {
+      const showMain = !!hit && !hit.clip.hidden;
+      const still = showMain && hit?.clip.kind === "image" ? getImage(hit.clip.src) : undefined;
+      const ready = !!still || (showMain && !!active && active.readyState >= 2);
+      // playing, and the next clip's video is still seeking: keep the picture already on screen for this frame
+      // (no copy of every frame is needed for that while playing)
+      const hold = playRef.current && showMain && !ready;
+      if (cv && ctx && !hold) {
         const keep = (lastFrame.current ??= document.createElement("canvas"));
         const sameSize = keep.width === cv.width && keep.height === cv.height;
-        const showMain = !!hit && !hit.clip.hidden;
-        const still = showMain && hit?.clip.kind === "image" ? getImage(hit.clip.src) : undefined;
-        if (still || (showMain && active && active.readyState >= 2)) {
+        if (ready) {
           ctx.fillStyle = "#000";
           ctx.fillRect(0, 0, cv.width, cv.height);
           if (still) drawMain(ctx, hit!.clip, still, still.naturalWidth, still.naturalHeight, cv.width, cv.height);
           else if (active) drawMain(ctx, hit!.clip, active, active.videoWidth, active.videoHeight, cv.width, cv.height);
-          if (!sameSize) (keep.width = cv.width), (keep.height = cv.height);
-          keep.getContext("2d")?.drawImage(cv, 0, 0);
+          // paused: keep a copy of this picture for while the next seek is on its way, once per new picture
+          const key = `${hit!.clip.id}|${still ? "image" : active?.currentTime}|${cv.width}x${cv.height}|${JSON.stringify(hit!.clip)}`;
+          if (!playRef.current && keepKey.current !== key) {
+            if (!sameSize) (keep.width = cv.width), (keep.height = cv.height);
+            keep.getContext("2d")?.drawImage(cv, 0, 0);
+            keepKey.current = key;
+          }
         } else if (showMain && sameSize) {
           // mid-seek: hold the previous frame instead of flashing black
           ctx.drawImage(keep, 0, 0);
@@ -508,7 +824,7 @@ export function OwnEditor() {
     const y0 = clip0 ? clip0.y ?? 0.5 : ov0!.y;
     const angle = (p: { x: number; y: number }) => (Math.atan2(p.y - box.cy, p.x - box.cx) * 180) / Math.PI;
     h.checkpoint();
-    const move = (ev: PointerEvent) => {
+    const move = perFrame((ev: PointerEvent) => {
       const p1 = toCanvas(ev);
       let patch: Partial<Clip> & Record<string, number> = {};
       if (mode === "move") {
@@ -533,8 +849,8 @@ export function OwnEditor() {
       h.apply(clip0
         ? { ...cur, clips: cur.clips.map((c) => (c.id === ref.id ? { ...c, ...patch } : c)) }
         : { ...cur, overlays: cur.overlays.map((o) => (o.id === ref.id ? ({ ...o, ...patch } as Overlay) : o)) });
-    };
-    const up = () => (window.removeEventListener("pointermove", move), window.removeEventListener("pointerup", up));
+    });
+    const up = () => (move.flush(), window.removeEventListener("pointermove", move), window.removeEventListener("pointerup", up));
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", up);
   };
@@ -546,17 +862,17 @@ export function OwnEditor() {
     setSel(ref);
     transformItem(e, ref, "move");
   };
-  /** the selection box drawn over the preview, in CSS pixels inside .preview */
-  const selBox = (() => {
+  /** the selection box drawn over the preview at time `at`, in CSS pixels inside .preview */
+  const selRectAt = (at: number): SelRect | null => {
     const cv = canvasRef.current;
     if (!sel || !cv || libPreview) return null;
-    const b = boxOf(sel, applyTrackStates(p), t);
+    const b = boxOf(sel, applyTrackStates(p), at);
     if (!b) return null;
     const a = cv.getBoundingClientRect();
     const host = cv.parentElement!.getBoundingClientRect();
     const k = a.width / cv.width;
     return { left: a.left - host.left + (b.cx - b.w / 2) * k, top: a.top - host.top + (b.cy - b.h / 2) * k, width: b.w * k, height: b.h * k, rot: b.rot };
-  })();
+  };
 
   // ------------------------------------------------------------------ edit helpers
   const patchClip = (id: string, patch: Partial<Clip>, live = false) => {
@@ -762,6 +1078,8 @@ export function OwnEditor() {
         }
         const m = { ...prepared, src };
         setLibrary((lib) => [...lib.filter((x) => x.name !== m.name), m]);
+        // the server makes a light preview copy of big or 60 fps video in the background; the preview switches to it
+        if (m.kind === "video" && src.startsWith("/out/uploads/")) void watchProxy(src);
         // clips on the timeline that lost this file (same name) point at the new copy again
         const before = new Set(libRef.current.map((x) => x.src));
         const gone = (src: string) => isMissing(src, before);
@@ -799,7 +1117,7 @@ export function OwnEditor() {
   };
   const addText = () => {
     const proj = pRef.current;
-    const start = Math.round(t * 10) / 10;
+    const start = Math.round(tRef.current * 10) / 10;
     const top = proj.tracks.find((x) => x.kind === "visual" && x.role !== "captions");
     const [next, track] = landing(proj, top?.id ?? "new", "visual", start, start + 3);
     const o: Overlay = { id: uid(), track, kind: "text", text: "New title", fontSize: 40, color: "#FFFFFF", x: 0.5, y: 0.5, start, end: start + 3 };
@@ -894,7 +1212,7 @@ export function OwnEditor() {
   const starts = clipStarts(p);
   /** snap a timeline time to the playhead, item edges, then a 0.1 s grid */
   const snap = (time: number, ignoreId?: string) => {
-    const tol = 8 / zoom;
+    const tol = 8 / zoomStore.get();
     const cur = pRef.current;
     const points = [tRef.current, 0, mainLength(cur), ...clipStarts(cur)];
     for (const x of itemsOn(cur)) if (x.id !== ignoreId) points.push(x.start, x.end);
@@ -902,7 +1220,7 @@ export function OwnEditor() {
     return Math.round(time * 10) / 10;
   };
   const trackRef = useRef<HTMLDivElement>(null);
-  const timeAtPointer = (clientX: number) => Math.max(0, (clientX - (trackRef.current?.getBoundingClientRect().left ?? 0)) / zoom);
+  const timeAtPointer = (clientX: number) => Math.max(0, (clientX - (trackRef.current?.getBoundingClientRect().left ?? 0)) / zoomStore.get());
   const rowAtPointer = (x: number, y: number): RowId | null => {
     for (const el of document.elementsFromPoint(x, y)) {
       const row = (el as HTMLElement).dataset?.row;
@@ -964,15 +1282,16 @@ export function OwnEditor() {
           return { type, id };
         })
         .filter((r) => !locked(rowOf(r)));
-    const move = (ev: PointerEvent) => {
+    const move = perFrame((ev: PointerEvent) => {
       if (!moved && Math.hypot(ev.clientX - x0, ev.clientY - y0) < 4) return;
       moved = true;
       const b = { x0, y0, x1: ev.clientX, y1: ev.clientY };
       setBox(b);
       const hits = within(b);
       setSelected([...base.filter((r) => !hits.some((x) => x.id === r.id)), ...hits]);
-    };
+    });
     const up = () => {
+      move.flush();
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", up);
       setBox(null);
@@ -987,9 +1306,12 @@ export function OwnEditor() {
     e.preventDefault();
     const x0 = e.clientX;
     const before = pRef.current;
+    const zoom = zoomStore.get();
     h.checkpoint();
-    const move = (ev: PointerEvent) => onMove((ev.clientX - x0) / zoom, ev);
+    // once a frame at most: on a slow laptop pointer moves arrive faster than the page can redraw
+    const move = perFrame((ev: PointerEvent) => onMove((ev.clientX - x0) / zoom, ev));
     const up = (ev: PointerEvent) => {
+      move.flush();
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", up);
       setHover(null);
@@ -1146,8 +1468,8 @@ export function OwnEditor() {
     e.stopPropagation();
     setLibPreview(null);
     seek(timeAtPointer(e.clientX));
-    const move = (ev: PointerEvent) => seek(timeAtPointer(ev.clientX));
-    const up = () => (window.removeEventListener("pointermove", move), window.removeEventListener("pointerup", up));
+    const move = perFrame((ev: PointerEvent) => seek(timeAtPointer(ev.clientX)));
+    const up = () => (move.flush(), window.removeEventListener("pointermove", move), window.removeEventListener("pointerup", up));
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", up);
   };
@@ -1161,14 +1483,15 @@ export function OwnEditor() {
     const x0 = e.clientX;
     const y0 = e.clientY;
     let moved = false;
-    const move = (ev: PointerEvent) => {
+    const move = perFrame((ev: PointerEvent) => {
       if (!moved && Math.hypot(ev.clientX - x0, ev.clientY - y0) < 5) return;
       moved = true;
       setGhost({ ...m, x: ev.clientX, y: ev.clientY });
       const row = rowAtPointer(ev.clientX, ev.clientY);
       setHover(row ? { row, ok: allowed(m.kind, pRef.current, row) } : null);
-    };
+    });
     const up = async (ev: PointerEvent) => {
+      move.flush();
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", up);
       setGhost(null);
@@ -1245,6 +1568,7 @@ export function OwnEditor() {
       undo: h.undo,
       redo: h.redo,
       // state of the real media elements behind the preview, for checks
+      renders: () => renders.current,
       media: () => {
         const firstAudio = [...audioEls.current.values()][0];
         return {
@@ -1259,15 +1583,11 @@ export function OwnEditor() {
   const selClip = sel?.type === "clip" ? p.clips.find((c) => c.id === sel.id) : undefined;
   const selOverlay = sel?.type === "overlay" ? p.overlays.find((o) => o.id === sel.id) : undefined;
   const selAudio = sel?.type === "audio" ? p.audios.find((a) => a.id === sel.id) : undefined;
-  const width = Math.max(total + 4, 12) * zoom;
-
-  const visualTracks = p.tracks.filter((x) => x.kind === "visual");
-  const audioTracks = p.tracks.filter((x) => x.kind === "audio");
-  const rowClass = (row: RowId, extra = "") =>
-    `track ${extra} ${hover?.row === row ? (hover.ok ? "drop-ok" : "drop-bad") : ""}`;
-  const rowEvents = (row: RowId) => ({ "data-row": row, onPointerDown: startBox });
-  const stateOf = (row: RowId): TrackState => (row === "main" ? p.main ?? {} : p.tracks.find((x) => x.id === row) ?? {});
-  const rowState = (row: RowId) => `${stateOf(row).locked ? "is-locked" : ""} ${stateOf(row).hidden ? "is-hidden" : ""} ${stateOf(row).muted ? "is-muted" : ""}`;
+  /** stable handlers for the memoised timeline */
+  const act = useActions<TimelineActions>({ grabClip, trimClip, grabOverlay, trimOverlay, grabAudio, trimAudio, startBox, scrub, toggleTrack });
+  const pressBox = (e: React.PointerEvent, mode: "move" | "scale" | "turn") => sel && transformItem(e, sel, mode);
+  /** typing in a text field: one Undo step per burst, the edit gets the text a moment after the keys stop */
+  const typeText = (id: string) => ({ onStart: h.checkpoint, onLive: (text: string) => patchOverlay(id, { text }, true) });
   const libItems: { name: string; kind: Media["kind"]; own: boolean; src: string }[] = [
     ...BUILT_IN.map((m) => ({ name: m.name, kind: m.kind, own: false, src: `/media/${m.name}` })),
     ...library.map((m) => ({ name: m.name, kind: m.kind, own: true, src: m.src })),
@@ -1276,7 +1596,7 @@ export function OwnEditor() {
   return (
     <div className="own">
       <div className="bar">
-        <button onClick={() => h.commit(splitAt(p, t))} title="S">Split at playhead</button>
+        <button onClick={() => h.commit(splitAt(p, tRef.current))} title="S">Split at playhead</button>
         <button onClick={removeSelected} disabled={!selected.length}>{selected.length > 1 ? `Delete ${selected.length}` : "Delete"}</button>
         <button onClick={h.undo} disabled={!h.canUndo}>Undo</button>
         <button onClick={h.redo} disabled={!h.canRedo}>Redo</button>
@@ -1354,18 +1674,10 @@ export function OwnEditor() {
         <div className="player" ref={playerRef}>
           <div className="preview">
             <canvas ref={canvasRef} width={W} height={H} onPointerDown={pressPreview} style={{ aspectRatio: `${W} / ${H}` }} />
-            {selBox && sel && (
-              <div className="tbox" style={{ left: selBox.left, top: selBox.top, width: selBox.width, height: selBox.height, transform: `rotate(${selBox.rot}deg)` }}
-                onPointerDown={(e) => transformItem(e, sel, "move")}>
-                {(["nw", "ne", "sw", "se"] as const).map((c) => (
-                  <span key={c} className={`corner ${c}`} title="Drag to resize" onPointerDown={(e) => transformItem(e, sel, "scale")} />
-                ))}
-                <span className="turn" title="Drag to rotate (hold Shift for 15° steps)" onPointerDown={(e) => transformItem(e, sel, "turn")}>⟳</span>
-              </div>
-            )}
+            <SelectionBox time={clock} rectAt={selRectAt} onPress={pressBox} />
             {libPreview && (
               <div className="lib-preview">
-                {libPreview.kind === "video" && <video key={libPreview.src} src={libPreview.src} controls autoPlay playsInline />}
+                {libPreview.kind === "video" && <video key={libPreview.src} src={libPreview.proxy ?? libPreview.src} controls autoPlay playsInline />}
                 {libPreview.kind === "image" && <img src={libPreview.src} alt={libPreview.name} />}
                 {libPreview.kind === "audio" && (
                   <div className="audio-prev"><b>{libPreview.name}</b><audio key={libPreview.src} src={libPreview.src} controls autoPlay /></div>
@@ -1379,7 +1691,7 @@ export function OwnEditor() {
             )}
           </div>
           <div className="player-bar">
-            <span className="time"><b>{fmt(t)}</b> / {fmt(total)}</span>
+            <TimeText time={clock} total={total} />
             <button className="play" onClick={() => (setLibPreview(null), setPlaying((v) => !v))} aria-label={playing ? "Pause" : "Play"} title="Space">
               {playing ? "❚❚" : "▶"}
             </button>
@@ -1436,7 +1748,7 @@ export function OwnEditor() {
           )}
           {selOverlay?.kind === "text" && (
             <div className="form">
-              <label>Text<input value={selOverlay.text} onChange={(e) => patchOverlay(selOverlay.id, { text: e.target.value })} /></label>
+              <label>Text<LiveText key={selOverlay.id} value={selOverlay.text} {...typeText(selOverlay.id)} /></label>
               <label>Font
                 <select value={selOverlay.font ?? DEFAULT_FONT} onChange={(e) => patchOverlay(selOverlay.id, { font: e.target.value })}>
                   {FONTS.map((f) => <option key={f.id} value={f.id}>{f.label}</option>)}
@@ -1500,7 +1812,7 @@ export function OwnEditor() {
                 {captionsOf(p).map((c) => (
                   <li key={c.id} className={isSel(c.id) ? "sel" : ""}>
                     <button className="cap-time" title="Go to this caption" onClick={() => (setSel({ type: "overlay", id: c.id }), seek(c.start))}>{short(c.start)}</button>
-                    <input aria-label={`Caption at ${short(c.start)}`} value={c.text} onFocus={() => (setSel({ type: "overlay", id: c.id }), seek(c.start))} onChange={(e) => patchOverlay(c.id, { text: e.target.value })} />
+                    <LiveText aria-label={`Caption at ${short(c.start)}`} value={c.text} onFocus={() => (setSel({ type: "overlay", id: c.id }), seek(c.start))} {...typeText(c.id)} />
                   </li>
                 ))}
               </ol>
@@ -1513,67 +1825,7 @@ export function OwnEditor() {
         </aside>
       </div>
 
-      <div className="tl-head">
-        <span>Timeline</span>
-        <label>Zoom <input type="range" min={20} max={200} value={zoom} onChange={(e) => setZoom(Number(e.target.value))} /></label>
-        <span className="hint">Drag from the Library onto any track. Drag clips sideways or onto another track. The main track keeps clips joined; audio goes only on audio tracks.</span>
-      </div>
-      <div className="tl-wrap">
-      <div className="tl-labels">
-        <div className="ruler" />
-        {visualTracks.map((tr, n) => <TrackHead key={tr.id} name={tr.role === "captions" ? "Captions" : `Track ${visualTracks.length - n + 1}`} kind="visual" state={tr} onToggle={(k) => toggleTrack(tr.id, k)} />)}
-        <TrackHead name="Main" kind="main" state={p.main ?? {}} onToggle={(k) => toggleTrack("main", k)} />
-        {audioTracks.map((tr, n) => <TrackHead key={tr.id} name={`Audio ${n + 1}`} kind="audio" state={tr} onToggle={(k) => toggleTrack(tr.id, k)} />)}
-        <div className="track new">New</div>
-      </div>
-      <div className="tl-scroll">
-        <div className="tl" style={{ width }} ref={trackRef}>
-          <div className="ruler" onPointerDown={scrub}>
-            {Array.from({ length: Math.ceil(width / zoom) }, (_, s) => (
-              <span key={s} style={{ left: s * zoom }}>{s}s</span>
-            ))}
-          </div>
-          {visualTracks.map((tr, n) => (
-            <div key={tr.id} className={rowClass(tr.id, `visual ${rowState(tr.id)}`)} data-label={`Track ${visualTracks.length - n + 1}`} {...rowEvents(tr.id)}>
-              {p.overlays.filter((o) => o.track === tr.id).map((o) => (
-                <div key={o.id} data-ref={`overlay:${o.id}`} className={`clip ${o.kind} ${isSel(o.id) ? "sel" : ""} ${o.kind !== "text" && missing(o.src) ? "lost" : ""}`} style={{ left: o.start * zoom, width: (o.end - o.start) * zoom }} onPointerDown={(e) => grabOverlay(e, o)}>
-                  <i className="h l" onPointerDown={(e) => trimOverlay(e, o, "start")} />
-                  <span>{o.kind === "text" ? o.text : o.kind === "video" ? o.name : (o as ImageOverlay).src.split("/").pop()}</span>
-                  <i className="h r" onPointerDown={(e) => trimOverlay(e, o, "end")} />
-                </div>
-              ))}
-            </div>
-          ))}
-          <div className={rowClass("main", `main ${rowState("main")}`)} data-label="Main" {...rowEvents("main")}>
-            {p.clips.map((c, i) => (
-              <div key={c.id} data-ref={`clip:${c.id}`} className={`clip ${c.kind === "image" ? "image" : "video"} ${isSel(c.id) ? "sel" : ""} ${missing(c.src) ? "lost" : ""}`} style={{ left: (starts[i] ?? 0) * zoom, width: clipLen(c) * zoom }} onPointerDown={(e) => grabClip(e, i)}>
-                <i className="h l" onPointerDown={(e) => trimClip(e, c, i, "in")} />
-                <span>{c.muted ? "(muted) " : ""}{c.name}</span>
-                <i className="h r" onPointerDown={(e) => trimClip(e, c, i, "out")} />
-              </div>
-            ))}
-            {mainLen === 0 && <span className="empty">Drop video or images here</span>}
-          </div>
-          {audioTracks.map((tr, n) => (
-            <div key={tr.id} className={rowClass(tr.id, `audio ${rowState(tr.id)}`)} data-label={`Audio ${n + 1}`} {...rowEvents(tr.id)}>
-              {p.audios.filter((a) => a.track === tr.id).map((a) => (
-                <div key={a.id} data-ref={`audio:${a.id}`} className={`clip audio ${isSel(a.id) ? "sel" : ""} ${missing(a.src) ? "lost" : ""}`} style={{ left: a.start * zoom, width: audioLen(a) * zoom }} onPointerDown={(e) => grabAudio(e, a)}>
-                  <i className="h l" onPointerDown={(e) => trimAudio(e, a, "start")} />
-                  <span>{a.name} ({Math.round(a.volume * 100)}%)</span>
-                  <i className="h r" onPointerDown={(e) => trimAudio(e, a, "end")} />
-                </div>
-              ))}
-            </div>
-          ))}
-          <div className={rowClass("new", "new")} data-label="New" {...rowEvents("new")}>
-            <span className="empty">Drop here for a new track</span>
-          </div>
-          <div className="playhead" style={{ left: t * zoom }}>
-            <span className="knob" onPointerDown={scrub} title="Drag to move the playhead" />
-          </div>
-        </div>
-      </div>
-      </div>
+      <Timeline p={p} selected={selected} hover={hover} librarySrcs={librarySrcs} zoomStore={zoomStore} time={clock} act={act} trackRef={trackRef} />
 
       <div className="export">
         <h4>Export</h4>

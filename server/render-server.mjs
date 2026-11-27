@@ -4,7 +4,7 @@ import express from "express";
 import cors from "cors";
 import ffmpegPath from "ffmpeg-static";
 import { spawn, spawnSync } from "node:child_process";
-import { createWriteStream, mkdirSync, statSync, writeFileSync } from "node:fs";
+import { createWriteStream, existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import path from "node:path";
@@ -83,8 +83,12 @@ export function render(project, height, name = `export_${Date.now()}.mp4`) {
 export function describe(file) {
   const log = spawnSync(ffmpegPath, ["-hide_banner", "-i", file], { encoding: "utf8" }).stderr;
   const v = /Stream #0:\d+.*?: Video: [^\n]*/.exec(log)?.[0] ?? "";
+  const size = /, (\d{2,5})x(\d{2,5})/.exec(v);
   return {
     codec: /Video: (\w+)/.exec(v)?.[1] ?? null,
+    width: size ? Number(size[1]) : null,
+    height: size ? Number(size[2]) : null,
+    fps: Number(/([\d.]+) fps/.exec(v)?.[1] ?? 0) || null,
     hdr: /smpte2084|arib-std-b67/.test(v),
     hasAudio: /Stream #0:\d+.*?: Audio:/.test(log),
   };
@@ -113,6 +117,54 @@ export function convert(src) {
     return { src: "/" + output, ms: Date.now() - started, bytes: statSync(output).size, from: info.codec, hdr: info.hdr };
   });
 }
+
+/**
+ * A light copy of an uploaded video for the editor's preview: the short side at most 720, at most 30 frames a second,
+ * and a keyframe every second, so playing and jumping around stay smooth on a slow laptop. Exports always read the
+ * original. Made in the background after the upload, one at a time and apart from the export queue, so it never
+ * delays an export. (Production: a job on the same worker, written next to the original in S3.)
+ */
+const proxies = new Map(); // original src -> { status: "working" | "ready" | "not-needed" | "failed", proxy?, ms?, error? }
+let proxyChain = Promise.resolve();
+export function makeProxy(src) {
+  const known = proxies.get(src);
+  if (known) return known;
+  const input = resolve(src);
+  const info = describe(input);
+  const short = Math.min(info.width ?? 0, info.height ?? 0);
+  const fast = (info.fps ?? 0) > 31;
+  if (!info.codec || (short <= 720 && !fast)) return proxies.set(src, { status: "not-needed" }).get(src);
+  const output = input.replace(/\.[^./]+$/, "") + ".proxy.mp4";
+  // made before a server restart
+  if (existsSync(output) && statSync(output).size > 0) return proxies.set(src, { status: "ready", proxy: "/" + output, ms: 0 }).get(src);
+  const state = { status: "working" };
+  proxies.set(src, state);
+  // the short side becomes 720 (a phone video stays upright), never enlarged
+  const scale = (info.width ?? 0) >= (info.height ?? 0) ? "scale=-2:'min(720,ih)'" : "scale='min(720,iw)':-2";
+  const vf = [scale, fast ? "fps=30" : null, "format=yuv420p"].filter(Boolean).join(",");
+  const args = [
+    "-y", "-hide_banner", "-i", input, "-map", "0:v:0", "-map", "0:a:0?", "-vf", vf,
+    "-c:v", "libx264", "-preset", "veryfast", "-crf", "28", "-g", "30", "-keyint_min", "30",
+    "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", output,
+  ];
+  proxyChain = proxyChain.then(async () => {
+    const started = Date.now();
+    try {
+      await ffmpeg(args);
+      Object.assign(state, { status: "ready", proxy: "/" + output, ms: Date.now() - started });
+    } catch (e) {
+      Object.assign(state, { status: "failed", error: String(e.message ?? e).slice(-300) });
+    }
+  });
+  return state;
+}
+app.post("/api/proxy", express.json({ limit: "64kb" }), (req, res) => {
+  try {
+    res.json(makeProxy(req.body.src));
+  } catch (e) {
+    res.status(500).json({ status: "failed", error: String(e.message ?? e) });
+  }
+});
 
 app.post("/api/render", express.json({ limit: "2mb" }), async (req, res) => {
   try {

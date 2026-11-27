@@ -102,6 +102,40 @@ Under the preview, like CapCut: the time as HH:MM:SS:FF, Play, a ratio menu and 
 
 A clip whose shape differs from the frame is shown whole with black bars (Fit, CapCut's default). The Inspector can switch a main-track clip to Fill, which crops it to cover the frame. Checked by `scripts/player-check.mjs`: at 9:16, 16:9 and 2.35:1 the preview, the server export and the browser export show the same frame (match 0.955 to 0.965).
 
+## Speed on a slower laptop (own core)
+
+Measured in Chrome with its CPU slowed 4x and 6x, on an edit like a real one: a 4-minute 1080p 60 fps recording cut into four clips, a picture-in-picture video, a title, a caption and music. "Worst" is the longest gap between two screen updates during the action; under 50 ms feels smooth, over 100 ms feels stuck. Production build (`npm run build`, then `npx vite preview`).
+
+| Action (CPU 4x slower) | Before | After |
+| --- | --- | --- |
+| Type a caption | 100 ms | 17 to 33 ms |
+| Drag the zoom slider | 83 ms | 33 to 67 ms |
+| Drag a title, trim a clip, scrub | 17 ms | 17 to 33 ms |
+| Playback, preview frames per second (6x slower) | 43 | 51 |
+| Jump to 2:00 until the picture shows (4x / 6x) | 316 / 860 ms | 33 / 565 ms |
+| Whole-editor re-renders: 15 letters typed / zoom drag / 4 s of play | 16 / 21 / 224 | 2 / 1 / 3 |
+
+What changed:
+
+- The playhead time is kept outside React state, so playing re-renders only the time, the playhead line and the selection box, not the editor.
+- The timeline is a memoised component, and each block re-renders only when its own item changes. Handlers come from one stable object (`useActions`).
+- Typing keeps the text in the field and hands it to the edit 120 ms after the keys stop, or when the field loses focus. A burst of typing is one Undo step; it used to be one step per letter.
+- Ruler labels are drawn only for the visible part, spaced to fit the zoom (1 s, 5 s, 30 s, 1 min). Zoom is a CSS variable, so blocks do not re-render when zooming. The slider updates the timeline at most once a frame.
+- Drag, trim, scrub, move-on-preview and box select handle at most one pointer move per frame.
+- After an upload, the server makes a light copy of any video over 720p or over 30 fps in the background: short side 720, 30 fps, a keyframe every second (`/api/proxy`). The preview switches to it when ready; the edit and every export keep the original. For the 4-minute recording it took about 70 s on the test laptop and is 55 MB instead of 242 MB.
+- While playing, the preview no longer copies every frame into its hold-frame canvas; it copies once per new picture when paused.
+
+Still open: the browser export of 15 s of that recording at 4x went from 7.6 s to 9 s. The likely reason is that the preview no longer loads the original, so the export has to fetch it first; this is not proven. The React development build (`npm run dev`) is about 3 to 4 times heavier than the production build, so measure speed on the production build.
+
+```
+node scripts/editing-speed-check.mjs <long video> 1,4,6   # gaps between screen updates while editing
+node scripts/lowend-check.mjs <long video> 1,4,6          # import, playback, seek, browser export (PROXY=1 waits for the copy)
+node scripts/profile-check.mjs <long video> 4             # re-renders and the busiest functions per action
+node scripts/speed-fixes-check.mjs <big video>            # one Undo per typing burst, zoom, no re-render on play, proxy
+```
+
+Set `BASE=http://localhost:5182` to run them against `npx vite preview --port 5182`.
+
 ## Run it
 
 Needs Node 20 or newer. FFmpeg is downloaded by `npm install` (the `ffmpeg-static` package); nothing else to install.
