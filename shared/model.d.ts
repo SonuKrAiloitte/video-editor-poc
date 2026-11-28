@@ -1,0 +1,17 @@
+import type { AudioItem, Overlay, Project, TrackKind } from "../src/own/project";
+export type ItemKind = "video" | "image" | "text" | "audio" | "effect";
+export function transitionDur(p: Project, i: number): number;
+export function mainStarts(p: Project): number[];
+export const ACCEPTS: Record<"main" | TrackKind, ItemKind[]>;
+export function canPlace(itemKind: ItemKind, trackKind: "main" | TrackKind): boolean;
+export function refuseReason(itemKind: ItemKind, trackKind: "main" | TrackKind): string | null;
+export const RATIOS: string[];
+export function resolveAspect(p: Project): string;
+export function frameSizeFor(aspect: string, short: number): [number, number];
+export function mainDuration(p: Project): number;
+export function audioLen(a: AudioItem): number;
+export function projectDuration(p: Project): number;
+export function layers(p: Project): Overlay[];
+export function applyTrackStates(p: Project): Project;
+export function normalizeProject(p: unknown): Project;
+export function overlapsOnTrack(items: { id: string; track: string; start: number; end: number }[], track: string, start: number, end: number, ignoreId?: string): boolean;

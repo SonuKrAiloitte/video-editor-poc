@@ -6,14 +6,16 @@
  */
 import {
   ALL_FORMATS, AudioBufferSink, AudioBufferSource, BlobSource, BufferTarget, CanvasSink, CanvasSource,
-  Input, Mp4OutputFormat, Output, QUALITY_HIGH,
+  Input, Mp4OutputFormat, Output, QUALITY_HIGH, type WrappedCanvas,
 } from "mediabunny";
 import { FFmpeg } from "@ffmpeg/ffmpeg";
 import coreURL from "@ffmpeg/core?url";
 import wasmURL from "@ffmpeg/core/wasm?url";
 import { buildFfmpegArgs } from "../../shared/ffmpeg-graph.js";
-import { drawOverlays, preloadOverlayAssets } from "./compose";
-import { clipLen, clipStarts, frameSize, totalDuration, type Project } from "./project";
+import { fontFor, needsRaster } from "../../shared/fonts.js";
+import { drawMain, drawOverlays, drawTurned, getImage, isPlain, mainRect, preloadOverlayAssets, rasteriseTitle } from "./compose";
+import { applyTrackStates } from "../../shared/model.js";
+import { clipLen, clipStarts, frameSize, overlayOut, totalDuration, type Project, type VideoOverlay } from "./project";
 
 export interface ExportResult {
   engine: string;
@@ -27,12 +29,35 @@ export interface ExportResult {
 type Progress = (fraction: number) => void;
 
 const FPS = 30;
+
+/**
+ * Titles FFmpeg cannot shape (Hindi and other joining scripts) become pictures: each is drawn to a PNG here
+ * in the browser and swapped for an image overlay at the same place and time. `store` says where the PNG goes.
+ */
+async function withRasterTitles(p: Project, height: 720 | 1080, store: (png: Blob) => Promise<string>): Promise<Project> {
+  const [W, H] = frameSize(p, height);
+  const overlays = await Promise.all(p.overlays.map(async (o) => {
+    if (o.kind !== "text" || (!needsRaster(o.text) && !o.rotation)) return o;
+    const { blob, width } = await rasteriseTitle(o, W, H);
+    return { id: o.id, track: o.track, kind: "image" as const, src: await store(blob), width: width / W, x: o.x, y: o.y, start: o.start, end: o.end, rotation: o.rotation };
+  }));
+  return { ...p, overlays };
+}
 const fetchBlob = (src: string) => fetch(src).then((r) => r.blob());
 
 // ---------------------------------------------------------------- 1. Mediabunny
-export async function exportMediabunny(p: Project, height: 720 | 1080, onProgress: Progress): Promise<ExportResult> {
+/** one decoder per video on the timeline, read forward one frame per output frame */
+interface FrameStream {
+  iter: AsyncIterator<WrappedCanvas | null>;
+  cur: WrappedCanvas | null;
+  /** where a main-track clip with its own size, position or turn is drawn */
+  rect?: { cx: number; cy: number; w: number; h: number };
+}
+
+export async function exportMediabunny(edit: Project, height: 720 | 1080, onProgress: Progress): Promise<ExportResult> {
   const t0 = performance.now();
-  const [W, H] = frameSize(p.aspect, height);
+  const p = applyTrackStates(edit);
+  const [W, H] = frameSize(p, height);
   const total = totalDuration(p);
   await preloadOverlayAssets(p);
 
@@ -46,11 +71,17 @@ export async function exportMediabunny(p: Project, height: 720 | 1080, onProgres
   await output.start();
 
   // audio is mixed offline with Web Audio, then handed over as one buffer
-  const mix = new OfflineAudioContext(2, Math.ceil(total * 48000), 48000);
-  const schedule = async (blob: Blob, from: number, to: number, at: number, gain: number) => {
-    const input = new Input({ source: new BlobSource(blob), formats: ALL_FORMATS });
+  const blobs = new Map<string, Promise<Blob>>();
+  const blobOf = (src: string) => {
+    if (!blobs.has(src)) blobs.set(src, fetchBlob(src));
+    return blobs.get(src)!;
+  };
+  const mix = new OfflineAudioContext(2, Math.max(1, Math.ceil(total * 48000)), 48000);
+  const schedule = async (src: string, from: number, to: number, at: number, gain: number) => {
+    if (gain === 0) return;
+    const input = new Input({ source: new BlobSource(await blobOf(src)), formats: ALL_FORMATS });
     const track = await input.getPrimaryAudioTrack();
-    if (!track || gain === 0) return;
+    if (!track) return;
     const g = mix.createGain();
     g.gain.value = gain;
     g.connect(mix.destination);
@@ -64,33 +95,85 @@ export async function exportMediabunny(p: Project, height: 720 | 1080, onProgres
       node.start(at + (s - from), s - timestamp, e - s);
     }
   };
-
   const starts = clipStarts(p);
-  let frame = 0;
-  const totalFrames = Math.round(total * FPS);
-  for (const [i, clip] of p.clips.entries()) {
-    const blob = await fetchBlob(clip.src);
-    const start = starts[i] ?? 0;
-    await schedule(blob, clip.in, clip.out, start, clip.muted ? 0 : p.originalVolume);
-
-    const input = new Input({ source: new BlobSource(blob), formats: ALL_FORMATS });
-    const track = await input.getPrimaryVideoTrack();
-    if (!track) throw new Error(`${clip.name}: no video track`);
-    if (!(await track.canDecode())) throw new Error(`${clip.name}: this browser cannot decode ${track.codec}`);
-    const sink = new CanvasSink(track, { width: W, height: H, fit: "cover" });
-    const n = Math.round(clipLen(clip) * FPS);
-    const stamps = Array.from({ length: n }, (_, k) => clip.in + k / FPS);
-    for await (const wrapped of sink.canvasesAtTimestamps(stamps)) {
-      const t = frame / FPS;
-      ctx.fillStyle = "#000";
-      ctx.fillRect(0, 0, W, H);
-      if (wrapped) ctx.drawImage(wrapped.canvas, 0, 0);
-      drawOverlays(ctx, p, t, W, H);
-      await video.add(t, 1 / FPS);
-      onProgress(++frame / totalFrames);
-    }
+  for (const [i, c] of p.clips.entries()) {
+    if (c.kind !== "image") await schedule(c.src, c.in, c.out, starts[i] ?? 0, c.muted ? 0 : p.originalVolume);
   }
-  if (p.music) await schedule(await fetchBlob(p.music.src), 0, total, 0, p.music.volume);
+  for (const o of p.overlays) {
+    if (o.kind === "video" && !o.muted && o.hasAudio) await schedule(o.src, o.in, overlayOut(o), o.start, p.originalVolume);
+  }
+  for (const a of p.audios) await schedule(a.src, a.in, a.out, a.start, a.volume);
+
+  // video: every output frame is drawn from scratch: main track, then each visual track from the lowest up
+  const streams = new Map<string, FrameStream>();
+  type Size = { width: number; height?: number; fit?: "cover" | "contain" | "fill" };
+  const open = async (id: string, name: string, src: string, from: number, frames: number, sizeFor: (sw: number, sh: number) => Size & { rect?: FrameStream["rect"] }) => {
+    const input = new Input({ source: new BlobSource(await blobOf(src)), formats: ALL_FORMATS });
+    const track = await input.getPrimaryVideoTrack();
+    if (!track) throw new Error(`${name}: no video track`);
+    if (!(await track.canDecode())) throw new Error(`${name}: this browser cannot decode ${track.codec}`);
+    const { rect, ...size } = sizeFor(track.displayWidth, track.displayHeight);
+    // poolSize: reuse a few canvases instead of allocating one per frame (matters on long exports)
+    const sink = new CanvasSink(track, { ...size, poolSize: 3 });
+    const stamps = Array.from({ length: frames }, (_, k) => from + k / FPS);
+    streams.set(id, { iter: sink.canvasesAtTimestamps(stamps)[Symbol.asyncIterator](), cur: null, rect });
+  };
+  const next = async (id: string) => {
+    const s = streams.get(id);
+    if (!s) return null;
+    const r = await s.iter.next();
+    if (!r.done && r.value) s.cur = r.value;
+    return s.cur;
+  };
+  const close = async (id: string) => {
+    await streams.get(id)?.iter.return?.();
+    streams.delete(id);
+  };
+  const F = (sec: number) => Math.round(sec * FPS);
+  const main = p.clips.map((c, i) => ({ c, from: F(starts[i] ?? 0), to: F((starts[i] ?? 0) + clipLen(c)) }));
+  const pips = p.overlays.filter((o): o is VideoOverlay => o.kind === "video" && !o.hidden).map((o) => ({ o, from: F(o.start), to: F(o.end) }));
+
+  const totalFrames = F(total);
+  for (let f = 0; f < totalFrames; f++) {
+    const t = f / FPS;
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, W, H);
+    const m = main.find((x) => f >= x.from && f < x.to);
+    if (m && !m.c.hidden) {
+      if (m.c.kind === "image") {
+        const img = getImage(m.c.src);
+        if (img) drawMain(ctx, m.c, img, img.naturalWidth, img.naturalHeight, W, H);
+      } else {
+        const c = m.c;
+        if (!streams.has(c.id)) await open(c.id, c.name, c.src, c.in + (f - m.from) / FPS, m.to - f, (sw, sh) => {
+          if (isPlain(c)) return { width: W, height: H, fit: c.fit === "fill" ? "cover" : "contain" };
+          // its own size, position or turn: decode at the size it is drawn, then place and turn it
+          const rect = mainRect(c, sw, sh, W, H);
+          return { width: Math.max(2, Math.round(rect.w)), height: Math.max(2, Math.round(rect.h)), fit: "fill", rect };
+        });
+        const fr = await next(c.id);
+        const rect = streams.get(c.id)?.rect;
+        if (fr && rect) drawTurned(ctx, fr.canvas, rect.cx, rect.cy, rect.w, rect.h, c.rotation);
+        else if (fr) ctx.drawImage(fr.canvas, 0, 0);
+        if (f === m.to - 1) await close(m.c.id);
+      }
+    }
+    const frames = new Map<string, WrappedCanvas>();
+    for (const x of pips) {
+      if (f < x.from || f >= x.to) continue;
+      if (!streams.has(x.o.id)) await open(x.o.id, x.o.name, x.o.src, x.o.in + (f - x.from) / FPS, x.to - f, () => ({ width: Math.max(2, Math.round((x.o.width * W) / 2) * 2) }));
+      const fr = await next(x.o.id);
+      if (fr) frames.set(x.o.id, fr);
+      if (f === x.to - 1) await close(x.o.id);
+    }
+    drawOverlays(ctx, p, t, W, H, (o) => {
+      const fr = frames.get(o.id);
+      return fr ? { src: fr.canvas, w: fr.canvas.width, h: fr.canvas.height } : null;
+    });
+    await video.add(t, 1 / FPS);
+    onProgress((f + 1) / totalFrames);
+  }
+  for (const id of [...streams.keys()]) await close(id);
   await audio.add(await mix.startRendering());
   await output.finalize();
 
@@ -100,8 +183,13 @@ export async function exportMediabunny(p: Project, height: 720 | 1080, onProgres
 
 // ---------------------------------------------------------------- 2. ffmpeg.wasm
 let wasm: FFmpeg | null = null;
-export async function exportFfmpegWasm(p: Project, height: 720 | 1080, onProgress: Progress): Promise<ExportResult> {
+export async function exportFfmpegWasm(original: Project, height: 720 | 1080, onProgress: Progress): Promise<ExportResult> {
   const t0 = performance.now();
+  const p = await withRasterTitles(original, height, async (png) => {
+    const url = URL.createObjectURL(png);
+    blobNames.set(url, "title.png");
+    return url;
+  });
   if (!wasm) {
     wasm = new FFmpeg();
     await wasm.load({ coreURL, wasmURL });
@@ -114,9 +202,10 @@ export async function exportFfmpegWasm(p: Project, height: 720 | 1080, onProgres
     if (!names.has(src)) names.set(src, `in${names.size}.${ext}`);
     return names.get(src)!;
   };
-  const { args, width, height: h, duration } = buildFfmpegArgs(p, { height, resolve, font: "font.ttf", output: "out.mp4", preset: "ultrafast" });
+  const { args, width, height: h, duration } = buildFfmpegArgs(p, { height, resolve, font: (file) => file, output: "out.mp4", preset: "ultrafast", seek: (globalThis as { __wasmSeek?: "input" | "filter" }).__wasmSeek });
   const put = async (name: string, src: string) => ff.writeFile(name, new Uint8Array(await (await fetch(src)).arrayBuffer()));
-  await put("font.ttf", "/fonts/PlusJakartaSans.ttf");
+  const fontFiles = new Set(p.overlays.flatMap((o) => (o.kind === "text" ? [fontFor(o.text, o.font).file] : [])));
+  for (const file of fontFiles) await put(file, `/fonts/${file}`);
   for (const [src, name] of names) await put(name, src);
 
   const onProg = ({ progress }: { progress: number }) => onProgress(Math.min(1, Math.max(0, progress)));
@@ -146,11 +235,14 @@ export async function exportServer(p: Project, height: 720 | 1080, onProgress: P
     }
     return uploaded.get(src)!;
   };
+  const upload = async (body: Blob, name: string) =>
+    ((await (await fetch(`/api/upload/${encodeURIComponent(name)}`, { method: "PUT", body })).json()) as { src: string }).src;
+  p = await withRasterTitles(p, height, (png) => upload(png, "title.png"));
   const project: Project = {
     ...p,
     clips: await Promise.all(p.clips.map(async (c) => ({ ...c, src: await remote(c.src) }))),
-    overlays: await Promise.all(p.overlays.map(async (o) => (o.kind === "image" ? { ...o, src: await remote(o.src) } : o))),
-    music: p.music ? { ...p.music, src: await remote(p.music.src) } : null,
+    overlays: await Promise.all(p.overlays.map(async (o) => (o.kind === "image" || o.kind === "video" ? { ...o, src: await remote(o.src) } : o))),
+    audios: await Promise.all(p.audios.map(async (a) => ({ ...a, src: await remote(a.src) }))),
   };
   onProgress(0.2);
   const r = await fetch("/api/render", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ project, height }) });

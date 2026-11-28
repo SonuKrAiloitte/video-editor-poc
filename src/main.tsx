@@ -7,7 +7,7 @@ const TwickDemo = lazy(() => import("./twick-demo").then((m) => ({ default: m.Tw
 const OwnEditor = lazy(() => import("./own/editor").then((m) => ({ default: m.OwnEditor })));
 
 const TABS = [
-  { hash: "#own", label: "B. Own core + Mediabunny / FFmpeg" },
+  { hash: "#own", label: "B. Own core + FFmpeg" },
   { hash: "#twick", label: "A. Twick Studio" },
 ];
 

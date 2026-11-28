@@ -22,6 +22,11 @@ h4 { margin: 10px 0 6px; font-size: 12px; text-transform: uppercase; letter-spac
 .pad { padding: 16px; }
 
 .app { display: flex; flex-direction: column; height: 100%; }
+/* Twick's stylesheet restyles the whole page (dark background, near-white text, Inter) and stays loaded after its tab
+   is left. Our editor states its own colours and font so it reads the same whichever tab was opened first. */
+.own, .top { background: var(--bg); color: var(--text); font: 13px/1.4 "Plus Jakarta Sans", system-ui, sans-serif; }
+.own button, .own select, .own input, .own label, .top { color: var(--text); }
+.top { background: var(--surface); }
 .top { display: flex; gap: 14px; align-items: center; padding: 8px 14px; border-bottom: 1px solid var(--line); background: var(--surface); flex-shrink: 0; }
 .top a { color: var(--muted); text-decoration: none; padding: 4px 10px; border-radius: 999px; }
 .top a.on { background: var(--accent); color: #fff; }
@@ -33,15 +38,59 @@ h4 { margin: 10px 0 6px; font-size: 12px; text-transform: uppercase; letter-spac
 .bar .saved { margin-left: auto; color: var(--muted); font-size: 12px; }
 .file { border: 1px solid var(--line); border-radius: 8px; padding: 5px 10px; cursor: pointer; background: var(--surface); }
 .file input { display: none; }
-.notice { margin-top: 8px; padding: 8px 10px; border-radius: 8px; background: var(--orange); }
+.lib-tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; padding: 3px; margin-bottom: 8px; background: var(--bg); border: 1px solid var(--line); border-radius: 9px; }
+.lib-tabs button { border: 0; background: transparent; border-radius: 6px; padding: 4px 6px; font-weight: 600; color: var(--muted); }
+.lib-tabs button.on { background: var(--surface); color: var(--text); box-shadow: 0 1px 2px rgba(20, 30, 60, 0.12); }
+.lib-tabs .count { font-weight: 500; font-size: 11px; color: var(--muted); }
+.lib-list { max-height: 260px; overflow-y: auto; }
+.file.lib-import { display: block; text-align: center; margin: 0 0 8px; background: var(--sky); border-color: #b9cdf5; font-weight: 600; }
+.notice { position: fixed; z-index: 60; top: 50px; right: 16px; width: min(460px, calc(100vw - 32px)); display: flex; gap: 10px; align-items: flex-start; padding: 8px 8px 8px 12px; border-radius: 10px; background: var(--orange); border: 1px solid #f3c9a2; box-shadow: 0 8px 24px rgba(20, 30, 60, 0.18); }
+.notice span { flex: 1; min-width: 0; }
+.own .notice button { flex: none; border: 0; background: transparent; padding: 0 6px; font-size: 16px; line-height: 1.2; }
 
 .stage { display: grid; grid-template-columns: 220px 1fr 240px; gap: 12px; margin-top: 10px; }
 .panel { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 4px 12px 12px; }
-.lib { display: block; width: 100%; text-align: left; margin-bottom: 5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* a Library item: click plays it, drag puts it on the timeline, + adds it at the playhead */
+.lib { display: flex; align-items: center; gap: 6px; width: 100%; margin-bottom: 5px; padding: 4px 4px 4px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
+.lib:hover { border-color: var(--accent); }
+.lib.playing { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.lib .lib-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.own .lib .lib-add { flex: none; width: 24px; height: 24px; padding: 0; border-radius: 6px; font-weight: 700; line-height: 1; background: var(--sky); border-color: #b9cdf5; }
 .tag { font-size: 10px; padding: 1px 6px; border-radius: 999px; }
 .tag.video { background: var(--sky); } .tag.audio { background: var(--green); } .tag.image { background: var(--pink); }
-.preview { display: flex; align-items: center; justify-content: center; background: #10131c; border-radius: 12px; height: 380px; padding: 10px; }
+.tag.fx, .tag.effect { background: #ece3ff; color: #4b2fb3; }
+.lib.fx { cursor: pointer; }
+/* player: preview on a dark ground with a control bar under it, like CapCut */
+.player { display: flex; flex-direction: column; background: #10131c; border-radius: 12px; overflow: hidden; min-width: 0; }
+.preview { position: relative; display: flex; align-items: center; justify-content: center; height: 340px; padding: 10px; }
+/* a Library file playing in the player, over the edit's preview */
+.lib-preview { position: absolute; inset: 0; display: flex; flex-direction: column; background: #0b0e15; }
+.lib-preview video, .lib-preview img { flex: 1; min-height: 0; width: 100%; object-fit: contain; }
+.lib-preview .audio-prev { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; color: #e8ecf4; }
+.lib-preview-bar { display: flex; gap: 8px; align-items: center; padding: 6px 10px; color: #c9cfdc; font-size: 12px; }
+.lib-preview-bar span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.own .lib-preview-bar button { background: transparent; border-color: #3a4152; color: #e8ecf4; }
+.player:fullscreen .preview { flex: 1; height: auto; }
 .preview canvas { max-width: 100%; max-height: 100%; height: 100%; background: #000; cursor: move; }
+.player-bar { display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 10px; padding: 6px 12px 8px; color: #c9cfdc; font-size: 12px; font-variant-numeric: tabular-nums; }
+.player-bar .time b { color: #4fd1e0; font-weight: 600; }
+.own .player-bar button { background: transparent; border-color: #3a4152; color: #e8ecf4; }
+.own .player-bar button:hover:not(:disabled) { border-color: #8ea3d6; }
+.player-bar .play { width: 34px; height: 30px; padding: 0; font-size: 13px; }
+.player-right { display: flex; gap: 8px; justify-content: flex-end; align-items: center; }
+.player-bar .icon { padding: 3px 8px; font-size: 15px; }
+.ratio { position: relative; }
+.own .player-bar .ratio-btn { min-width: 64px; font-weight: 600; }
+.ratio-menu { position: absolute; right: 0; bottom: calc(100% + 6px); z-index: 20; min-width: 190px; padding: 6px; background: #1d2230; border: 1px solid #3a4152; border-radius: 10px; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4); display: flex; flex-direction: column; }
+.own .ratio-menu button { display: grid; grid-template-columns: 16px 1fr auto; align-items: center; gap: 8px; border: 0; border-radius: 6px; padding: 6px 8px; text-align: left; color: #e8ecf4; }
+.own .ratio-menu button:hover { background: #2a3142; }
+.ratio-menu .tick { color: #4fd1e0; }
+.ratio-menu .sub { color: #8b93a7; font-size: 11px; }
+.ratio-icon { display: inline-block; border: 1.5px solid #aeb6c8; border-radius: 2px; }
+.seg { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; font-size: 12px; color: var(--muted); }
+.seg span { width: 100%; }
+.own .seg button { flex: 1; font-size: 11px; padding: 4px 6px; }
+.own .seg button.on { background: var(--sky); border-color: #b9cdf5; font-weight: 600; }
 .form { display: flex; flex-direction: column; gap: 8px; }
 .form label { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--muted); }
 .form label.row { flex-direction: row; align-items: center; gap: 6px; color: var(--text); }
@@ -49,21 +98,57 @@ h4 { margin: 10px 0 6px; font-size: 12px; text-transform: uppercase; letter-spac
 
 .tl-head { display: flex; gap: 14px; align-items: center; margin-top: 12px; }
 .tl-head > span:first-child { font-weight: 600; }
-.tl-scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); margin-top: 6px; padding-left: 64px; }
+.tl-wrap { display: flex; margin-top: 6px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); overflow: hidden; }
+/* track names: their own column, outside the part that scrolls sideways, so they stay in view */
+.tl-labels { flex: none; width: 150px; border-right: 1px solid var(--line); background: var(--surface); }
+.tl-labels .ruler { cursor: default; }
+.tl-labels .track { display: flex; align-items: center; gap: 2px; padding: 0 6px 0 10px; font-size: 11px; color: var(--muted); }
+.tl-labels .tname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* lock / hide / mute buttons on a track header */
+.own .tl-labels .tbtn { display: grid; place-items: center; width: 26px; height: 26px; padding: 0; border: 1px solid transparent; background: transparent; color: var(--muted); border-radius: 6px; }
+.own .tl-labels .tbtn:hover { border-color: var(--line); color: var(--text); }
+.own .tl-labels .tbtn.on { background: #fde8e8; color: #b42318; border-color: #f5c2c2; }
+.tl-labels .tbtn-space { width: 26px; }
+.tl-labels .track.is-locked .tname::after { content: " (locked)"; }
+/* how a track looks while locked, hidden or muted */
+.track.is-locked { background-image: repeating-linear-gradient(135deg, transparent 0 8px, rgba(40, 62, 115, 0.06) 8px 16px); }
+.track.is-locked .clip { cursor: not-allowed; }
+.track.is-hidden .clip:not(.audio) { opacity: 0.4; }
+.track.is-muted .clip.audio, .track.is-muted .clip.video { filter: grayscale(0.8); }
+/* box selection */
+.marquee { position: fixed; z-index: 40; pointer-events: none; border: 1px solid #2f5fd0; background: rgba(47, 95, 208, 0.12); }
+.tl-scroll { flex: 1; min-width: 0; overflow-x: auto; }
 .tl { position: relative; padding-bottom: 6px; }
 .ruler { position: relative; height: 22px; border-bottom: 1px solid var(--line); cursor: ew-resize; user-select: none; }
 .ruler span { position: absolute; top: 3px; font-size: 10px; color: var(--muted); border-left: 1px solid var(--line); padding-left: 3px; height: 100%; }
 .track { position: relative; height: 40px; border-bottom: 1px dashed var(--line); }
-.track::before { content: attr(data-label); position: absolute; left: -58px; top: 12px; font-size: 11px; color: var(--muted); }
+/* a block's place: --s start and --d length in seconds, --z the zoom on .tl, so a zoom change re-renders no block */
+.tl .clip { left: calc(var(--s) * var(--z) * 1px); width: calc(var(--d) * var(--z) * 1px); }
 .clip { position: absolute; top: 5px; height: 30px; border-radius: 6px; display: flex; align-items: center; overflow: hidden; border: 1px solid transparent; user-select: none; cursor: grab; touch-action: none; }
 .clip span { flex: 1; padding: 0 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 11px; pointer-events: none; }
 .clip.video { background: var(--sky); border-color: #b9cdf5; }
 .clip.text { background: var(--pink); border-color: #f3bccd; }
 .clip.image { background: var(--orange); border-color: #f3c9a2; }
-.clip.audio { background: var(--green); border-color: #b5dfc4; cursor: default; }
+.clip.effect { background: #ece3ff; border-color: #cdb8f5; }
+/* the part of a clip that plays during the transition into it (both clips at once) */
+.tl .clip .overlap { position: absolute; left: 0; top: 0; bottom: 0; width: calc(var(--f) * var(--z) * 1px); background: repeating-linear-gradient(135deg, rgba(60, 40, 140, 0.18) 0 4px, transparent 4px 8px); pointer-events: none; }
+/* the button on each join between two main-track clips: + adds a transition, ⇄ has one */
+.tl .join { position: absolute; left: calc(var(--s) * var(--z) * 1px); top: 50%; transform: translate(-50%, -50%); width: 20px; height: 20px; padding: 0; border-radius: 50%; border: 1px solid #cdb8f5; background: #fff; color: #6d4ce8; font-size: 12px; line-height: 18px; font-weight: 700; z-index: 4; cursor: pointer; box-shadow: 0 1px 2px rgba(20, 30, 60, 0.15); }
+.tl .join.on { background: #6d4ce8; color: #fff; border-color: #6d4ce8; }
+.tl .join.picked { outline: 2px solid #e5484d; outline-offset: 1px; }
+.clip.audio { background: var(--green); border-color: #b5dfc4; }
+.track.main { background: #f6f8fd; }
+.track.audio { background: #f7fbf8; }
+.track.new { height: 30px; border-bottom: 0; }
+.track .empty { position: absolute; left: 8px; top: 50%; transform: translateY(-50%); font-size: 11px; color: var(--muted); pointer-events: none; }
+.track.drop-ok { background: #e2edff; outline: 2px dashed #2f5fd0; outline-offset: -2px; }
+.track.drop-bad { background: #fdecec; outline: 2px dashed #c0392b; outline-offset: -2px; cursor: not-allowed; }
 .clip.sel { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
 .clip .h { width: 7px; align-self: stretch; background: rgba(40, 62, 115, 0.35); cursor: ew-resize; flex-shrink: 0; }
-.playhead { position: absolute; top: 0; bottom: 0; width: 2px; background: #e5484d; pointer-events: none; }
+.playhead { position: absolute; top: 0; bottom: 0; width: 2px; background: #e5484d; pointer-events: none; z-index: 5; }
+/* the handle on top of the playhead: grab it to move the playhead */
+.playhead .knob { position: absolute; top: 0; left: -7px; width: 16px; height: 20px; background: #e5484d; border-radius: 4px 4px 8px 8px; pointer-events: auto; cursor: ew-resize; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3); touch-action: none; }
+.playhead .knob::after { content: ""; position: absolute; left: 5px; top: 5px; width: 6px; height: 6px; border-radius: 50%; background: #fff; }
 
 .export { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 12px; }
 .export h4 { margin: 0; }
@@ -74,6 +159,66 @@ h4 { margin: 10px 0 6px; font-size: 12px; text-transform: uppercase; letter-spac
 .results tr.err td { color: #b42318; white-space: pre-wrap; }
 .result-video { width: 100%; max-height: 300px; background: #000; border-radius: 8px; }
 
-.twick-wrap { flex: 1; min-height: 0; overflow-y: auto; }
-.twick-log { padding: 6px 14px; background: var(--sky); color: var(--text); font-size: 12px; }
-.twick-host { height: 100vh; position: relative; }
+/* Twick must fit the window below the tab bar and log line. With height: 100vh it was 72px taller than the
+   space it had, so its timeline started below the bottom edge and clips added with "+" looked like they went nowhere. */
+.twick-wrap { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+.twick-log { padding: 6px 14px; background: var(--sky); color: var(--text); font-size: 12px; flex: none; }
+.twick-host { flex: 1; min-height: 0; position: relative; }
+.twick-host .studio-container { height: 100%; } /* Twick sets 100vh, which ignores our tab bar */
+/* Twick sizes its preview from the column width, so on a laptop screen the preview alone fills the column and the
+   timeline sits below it, out of sight. Give the timeline its room first; the preview shrinks to what is left
+   (Twick redraws its canvas when its box changes size). */
+.twick-host .studio-content { flex: 1 1 0; min-height: 0; }
+.twick-host .studio-content > * { min-height: 0; }
+.twick-host .sidebar { overflow-y: auto; }
+.twick-host .canvas-wrapper { overflow: hidden; }
+.twick-host .canvas-wrapper > .canvas-container { height: 100%; }
+.twick-host .twick-editor-main-container { height: 100%; }
+.twick-host .twick-editor-view-section { flex: 1 1 0; min-height: 0; }
+.twick-host .twick-editor-container { height: 100%; }
+.twick-host .twick-editor-timeline-section { flex: none; max-height: 45%; }
+
+button.minor { font-size: 12px; border-style: dashed; opacity: 0.8; }
+.ghost { position: fixed; z-index: 50; pointer-events: none; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 4px 8px; font-size: 12px; box-shadow: 0 4px 14px rgba(20, 30, 60, 0.18); }
+.ghost.bad { border-color: #c0392b; }
+.ghost em { color: #c0392b; font-style: normal; }
+.lib { touch-action: none; cursor: grab; }
+
+/* a clip whose file is gone (imported before files were kept, then the page reloaded) */
+.clip.lost { background: #fdecec !important; border-color: #c0392b !important; border-style: dashed !important; }
+.clip.lost span::before { content: "missing file: "; color: #b42318; font-weight: 600; }
+
+/* Library: "Added" marks a file used on the timeline; x takes an imported file out of the Library */
+.lib .added { flex: none; font-size: 10px; font-weight: 600; padding: 1px 6px; border-radius: 999px; background: var(--green); color: #1c6b3c; }
+.own .lib .lib-remove { flex: none; width: 22px; height: 24px; padding: 0; border: 1px solid transparent; background: transparent; color: var(--muted); font-size: 15px; line-height: 1; }
+.own .lib .lib-remove:hover { color: #b42318; border-color: #f5c2c2; background: #fdecec; }
+
+/* a file being imported: its row shows what is happening instead of a pop-up */
+.lib.pending { cursor: default; background: var(--bg); border-style: dashed; }
+.lib.pending .step { flex: none; font-size: 11px; color: var(--muted); }
+.spinner { flex: none; width: 12px; height: 12px; border-radius: 50%; border: 2px solid #b9cdf5; border-top-color: #2f5fd0; animation: spin 0.8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spinner { animation: none; } }
+
+/* captions panel */
+.form .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; align-items: end; }
+.captions .file { text-align: center; font-size: 12px; }
+.cap-list { list-style: none; margin: 0; padding: 0; max-height: 200px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; }
+.cap-list li { display: flex; gap: 4px; align-items: center; border-radius: 6px; padding: 2px; }
+.cap-list li.sel { background: var(--sky); }
+.own .cap-list .cap-time { flex: none; padding: 3px 6px; font-size: 11px; font-variant-numeric: tabular-nums; }
+.cap-list input { flex: 1; min-width: 0; border: 1px solid var(--line); border-radius: 6px; padding: 4px 6px; font: inherit; }
+.panel { overflow-y: auto; }
+/* the side panels never grow taller than the player: a long Inspector or captions list scrolls inside its panel
+   instead of pushing the timeline down under the pointer */
+.stage > .panel { max-height: 384px; min-height: 0; overflow-y: auto; }
+
+/* selection box on the preview: drag inside to move, a corner to resize, the round handle to rotate (like CapCut) */
+.tbox { position: absolute; z-index: 3; border: 1.5px solid #fff; box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35); cursor: move; touch-action: none; }
+.tbox .corner { position: absolute; width: 14px; height: 14px; border-radius: 50%; background: #fff; border: 1px solid rgba(0, 0, 0, 0.35); touch-action: none; }
+.tbox .corner.nw { left: -8px; top: -8px; cursor: nwse-resize; }
+.tbox .corner.ne { right: -8px; top: -8px; cursor: nesw-resize; }
+.tbox .corner.sw { left: -8px; bottom: -8px; cursor: nesw-resize; }
+.tbox .corner.se { right: -8px; bottom: -8px; cursor: nwse-resize; }
+.tbox .turn { position: absolute; left: 50%; bottom: -34px; transform: translateX(-50%); width: 24px; height: 24px; border-radius: 50%; background: #fff; color: #1b2233; display: grid; place-items: center; font-size: 15px; cursor: grab; touch-action: none; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4); }
+.preview { overflow: visible; }
